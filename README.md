@@ -1,5 +1,19 @@
 # Cleansed k-nearest neighbor (CKNN)
 
+This is the official PyTorch implementation of CKNN, published in **CIKM 2024** ([paper](https://arxiv.org/abs/2408.03014)).
+
+## Citation
+
+If you use code or refer to CKNN for your research, please cite your paper:
+```
+@article{yi2024cknn,
+  title={CKNN: Cleansed k-Nearest Neighbor for Unsupervised Video Anomaly Detection},
+  author={Yi, Jihun and Yoon, Sungroh},
+  journal={arXiv preprint arXiv:2408.03014},
+  year={2024}
+}
+```
+
 # Installation
 
 #### Step 1. Install libraries
