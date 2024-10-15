@@ -1,0 +1,17 @@
+signals:
+  app:
+    use: true
+    NN: 8
+    coreset: 1
+    cleanse_scorename: "aerecon"
+    percentile_cleanse: 75
+
+  mot:
+    use: true
+    NN: 8
+    coreset: 1
+    cleanse_scorename: "velo_fgmm"
+    percentile_cleanse: 75
+
+postprocess:
+  sigma: 5
