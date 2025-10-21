@@ -82,7 +82,7 @@ def main(args, config):
     d['AUROC'] = d_AUROC['all']
 
     AUROC = np.mean(list(d_AUROC['all'].values()))
-    print(f'AUROC {args.dataset_name} ({args.mode}): {AUROC:.1f}', end='')
+    print(f'AUROC {args.dataset_name} ({args.mode}): {AUROC:.6f}', end='')
     if args.quiet:
         print()
     else:
