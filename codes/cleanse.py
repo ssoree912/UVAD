@@ -305,13 +305,17 @@ class AppAErecon(Cleanse):
             self._log('Removed pruning reparameterizations; model is now dense.')
 
     def _capture_state_dict(self):
-        model_copy = copy.deepcopy(self.net).to('cpu')
-        for module in model_copy.modules():
-            if isinstance(module, (nn.Conv2d, nn.Linear)):
-                try:
-                    prune.remove(module, 'weight')
-                except ValueError:
-                    continue
+        model_copy = AppAE().to('cpu')
+        orig_modules = list(self.net.modules())
+        copy_modules = list(model_copy.modules())
+
+        for orig, copy_m in zip(orig_modules, copy_modules):
+            if isinstance(orig, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+                with torch.no_grad():
+                    copy_m.weight.data.copy_(orig.weight.detach().cpu())
+                    if orig.bias is not None and copy_m.bias is not None:
+                        copy_m.bias.data.copy_(orig.bias.detach().cpu())
+
         return {k: v.detach().cpu() for k, v in model_copy.state_dict().items()}
 
     def _compose_run_command(self) -> str:
