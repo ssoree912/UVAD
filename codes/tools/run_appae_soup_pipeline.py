@@ -348,6 +348,8 @@ def main():
     torch.save(merged_state, output_checkpoint)
     logger.info("Saved merged checkpoint to %s", output_checkpoint)
 
+    score_template = args.score_output_template
+
     metadata = {
         "dataset_name": args.dataset_name,
         "uvadmode": args.uvadmode,

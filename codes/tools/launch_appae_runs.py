@@ -54,6 +54,8 @@ def parse_args() -> argparse.Namespace:
                         help="Random seeds for random pruning masks.")
     parser.add_argument("--random_unprune_epochs", nargs="+", type=int, default=[-1],
                         help="Epochs after which to unprune random runs (use -1 to keep pruned).")
+    parser.add_argument("--skip_magnitude_run", action="store_true",
+                        help="Skip launching the pure magnitude-pruned baseline run.")
 
     parser.add_argument("--gpus", nargs="+", type=int, default=None,
                         help="GPU IDs to cycle through. If omitted, runs execute on CPU.")
@@ -95,16 +97,17 @@ def build_run_specs(args: argparse.Namespace) -> List[RunSpec]:
 
     if args.magnitude_seed is not None:
         amt = format_amount(args.magnitude_prune)
-        run_name = f"mag{amt}_seed{args.magnitude_seed}"
-        specs.append(RunSpec(
-            seed=args.magnitude_seed,
-            run_name=run_name,
-            magnitude=args.magnitude_prune,
-            random=0.0,
-            random_seed=None,
-            unprune_epoch=None,
-            label="magnitude"
-        ))
+        if not args.skip_magnitude_run:
+            run_name = f"mag{amt}_seed{args.magnitude_seed}"
+            specs.append(RunSpec(
+                seed=args.magnitude_seed,
+                run_name=run_name,
+                magnitude=args.magnitude_prune,
+                random=0.0,
+                random_seed=None,
+                unprune_epoch=None,
+                label="magnitude"
+            ))
 
         rand_amt = format_amount(args.random_prune)
         for rand_seed in args.random_seeds:
