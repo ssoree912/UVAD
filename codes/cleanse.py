@@ -1,17 +1,20 @@
 from glob import glob
 import copy
 import json
-from pathlib import Path
+import logging
+import shutil
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.nn as nn
 from sklearn.mixture import GaussianMixture
+from torch.nn.utils import prune
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-
-import torch.nn as nn
 
 
 class AppAE(nn.Module):
@@ -118,45 +121,96 @@ class PatchDataset(Dataset):
 
 
 class AppAErecon(Cleanse):
-    def __init__(self, dataset_name, uvadmode):
+    def __init__(self,
+                 dataset_name,
+                 uvadmode,
+                 *,
+                 run_name: str = "default",
+                 save_root: str = "artifacts",
+                 log_dir: str = "logger",
+                 logger: Optional[logging.Logger] = None,
+                 device: Optional[torch.device] = None,
+                 epochs: int = 10,
+                 batch_size: int = 64,
+                 optimizer_lr: float = 1e-3,
+                 num_workers: int = 4,
+                 magnitude_prune: float = 0.0,
+                 random_prune: float = 0.0,
+                 random_prune_seed: Optional[int] = None,
+                 unprune_epoch: Optional[int] = None,
+                 eval_config: Optional[str] = None,
+                 eval_interval: int = 0,
+                 seed: int = 111,
+                 config_path: Optional[str] = None):
         super().__init__(dataset_name, uvadmode)
 
-        self.batch_size = 64
-        self.checkpoint_dir = Path('artifacts') / self.dataset_name / self.uvadmode
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logger or logging.getLogger(f"AppAErecon.{run_name}")
+        self.run_name = run_name
+        self.save_root = Path(save_root)
+        self.log_dir = Path(log_dir)
+        self.config_path = Path(config_path) if config_path else None
+        self.run_dir = self.save_root / self.dataset_name / self.uvadmode / self.run_name
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        self.batch_size = batch_size
+        self.num_workers = num_workers
         self.loss_history = []
         self.best_state_dict = None
         self.best_epoch = None
+        self.best_loss = None
+        self.seed = seed
+
+        self.magnitude_prune = magnitude_prune
+        self.random_prune = random_prune
+        self.random_prune_seed = random_prune_seed
+        self.unprune_epoch = unprune_epoch
+        self.eval_config = eval_config
+        self.eval_interval = eval_interval
+        self.num_epochs = epochs
+        self.optimizer_name = 'Adam'
+        self.optimizer_lr = optimizer_lr
 
         fpaths = self.get_app_fpaths()
         if not fpaths:
             raise RuntimeError(f'No patches found for dataset="{self.dataset_name}" '
                                f'and uvadmode="{self.uvadmode}". '
                                'Check that patches are placed correctly.')
-        print(f'[INFO] AppAE training set size: {len(fpaths)} patches '
-              f'({self.dataset_name}, {self.uvadmode}).', flush=True)
-        print('[INFO] Loading patch tensors into batches...', flush=True)
+        self._log('Run directory: %s', self.run_dir)
+        self._log('AppAE training set size: %d patches (%s, %s).',
+                  len(fpaths), self.dataset_name, self.uvadmode)
+        self._log('Loading patch tensors into batches...')
+        self._log('Hyperparameters -> epochs=%d, batch_size=%d, lr=%.6f, workers=%d',
+                  self.num_epochs, self.batch_size, self.optimizer_lr, self.num_workers)
+        self._log('Pruning -> magnitude=%.2f%%, random=%.2f%%, unprune_epoch=%s (random_seed=%s)',
+                  self.magnitude_prune * 100,
+                  self.random_prune * 100,
+                  str(self.unprune_epoch) if self.unprune_epoch is not None else 'None',
+                  str(self.random_prune_seed) if self.random_prune_seed is not None else 'None')
+
         dataset_train = PatchDataset(fpaths)
         loader_train = DataLoader(dataset_train, batch_size=self.batch_size,
-                                  shuffle=True, num_workers=4)
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f'[INFO] Using device: {self.device}', flush=True)
-        self.net = AppAE().to(self.device)
-        opt = optim.Adam(self.net.parameters())
-        self.optimizer_lr = opt.param_groups[0]['lr']
+                                  shuffle=True, num_workers=self.num_workers)
 
-        self.num_epochs = 10
-        print(f'[INFO] Starting AppAE training for {self.num_epochs} epochs.', flush=True)
-        best_loss = None
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
+        self._log('Using device: %s', self.device)
+        self.net = AppAE().to(self.device)
+        self.prunable_modules = [m for m in self.net.modules()
+                                 if isinstance(m, (nn.Conv2d, nn.Linear))]
+        self._apply_initial_pruning()
+
+        opt = optim.Adam(self.net.parameters(), lr=self.optimizer_lr)
+
+        self._log('Starting AppAE training for %d epochs.', self.num_epochs)
         for i_epoch in range(1, self.num_epochs + 1):
-            print(f'[INFO] Epoch {i_epoch:02d}/{self.num_epochs} running...', flush=True)
+            self._log('Epoch %02d/%02d running...', i_epoch, self.num_epochs)
             running_loss = 0.0
             pbar = tqdm(enumerate(loader_train), total=len(loader_train),
                         desc=f'Training AE. Epoch {i_epoch:02d}', leave=False,
                         dynamic_ncols=True, mininterval=1.0, miniters=100)
-            for i_batch, batch in pbar:
-                xs = batch
-                xs = xs.to(self.device)
+            for _, batch in pbar:
+                xs = batch.to(self.device)
 
                 opt.zero_grad()
 
@@ -169,28 +223,39 @@ class AppAErecon(Cleanse):
                 loss_value = loss.item()
                 running_loss += loss_value * xs.size(0)
                 pbar.set_postfix_str(f'loss={loss_value:.5f}')
-            avg_loss = running_loss / len(dataset_train)
-            print(f'[INFO] Epoch {i_epoch:02d} average reconstruction loss: {avg_loss:.6f}',
-                  flush=True)
-            self.loss_history.append(float(avg_loss))
-            if best_loss is None or avg_loss < best_loss:
-                best_loss = float(avg_loss)
-                self.best_epoch = i_epoch
-                self.best_state_dict = {k: v.detach().cpu().clone()
-                                        for k, v in self.net.state_dict().items()}
 
-        self._save_training_artifacts(best_loss)
+            avg_loss = running_loss / len(dataset_train)
+            self._log('Epoch %02d average reconstruction loss: %.6f', i_epoch, avg_loss)
+            self.loss_history.append(float(avg_loss))
+
+            if self.best_loss is None or avg_loss < self.best_loss:
+                self.best_loss = float(avg_loss)
+                self.best_epoch = i_epoch
+                self.best_state_dict = self._capture_state_dict()
+                self._log('New best model at epoch %02d (loss=%.6f).',
+                          self.best_epoch, self.best_loss)
+
+            if self.unprune_epoch is not None and i_epoch == self.unprune_epoch:
+                self._log('Unpruning network parameters at epoch %02d.', i_epoch)
+                self._remove_pruning()
+
+        if self.best_state_dict is None:
+            self.best_state_dict = self._capture_state_dict()
+            self.best_epoch = self.num_epochs
+            self.best_loss = float(self.loss_history[-1])
+
+        self._save_training_artifacts()
         if self.best_state_dict is not None:
             self.net.load_state_dict(self.best_state_dict)
 
     def infer(self):
         fpaths = self.get_app_fpaths()
-        print(f'[INFO] AppAE inference on {len(fpaths)} patches '
-              f'({self.dataset_name}, {self.uvadmode}).', flush=True)
-        print('[INFO] Beginning inference pass for reconstruction loss estimation.', flush=True)
+        self._log('AppAE inference on %d patches (%s, %s).',
+                  len(fpaths), self.dataset_name, self.uvadmode)
+        self._log('Beginning inference pass for reconstruction loss estimation.')
         dataset_test = PatchDataset(fpaths)
         loader_train = DataLoader(dataset_test, batch_size=self.batch_size,
-                                  shuffle=False, num_workers=4)
+                                  shuffle=False, num_workers=self.num_workers)
         ret = []
         for i_batch, batch in tqdm(enumerate(loader_train), total=len(loader_train),
                                    desc='Inferring AE scores', leave=True, dynamic_ncols=True):
@@ -205,74 +270,175 @@ class AppAErecon(Cleanse):
         ret = np.concatenate(ret)
         return ret
 
-    def _save_training_artifacts(self, best_loss):
+    def _log(self, msg, *args):
+        if self.logger:
+            self.logger.info(msg, *args)
+        else:
+            print(msg % args, flush=True)
+
+    def _apply_initial_pruning(self):
+        if not self.prunable_modules:
+            return
+        if self.magnitude_prune > 0:
+            self._log('Applying magnitude pruning: %.2f%%', self.magnitude_prune * 100)
+            for module in self.prunable_modules:
+                prune.l1_unstructured(module, name='weight', amount=self.magnitude_prune)
+        if self.random_prune > 0:
+            if self.random_prune_seed is not None:
+                torch.manual_seed(self.random_prune_seed)
+                np.random.seed(self.random_prune_seed)
+            self._log('Applying random pruning: %.2f%% (seed=%s)',
+                      self.random_prune * 100,
+                      self.random_prune_seed if self.random_prune_seed is not None else 'default')
+            for module in self.prunable_modules:
+                prune.random_unstructured(module, name='weight', amount=self.random_prune)
+            torch.manual_seed(self.seed)
+            np.random.seed(self.seed)
+
+    def _remove_pruning(self):
+        removed_any = False
+        for module in self.prunable_modules:
+            if hasattr(module, 'weight_orig'):
+                prune.remove(module, 'weight')
+                removed_any = True
+        if removed_any:
+            self._log('Removed pruning reparameterizations; model is now dense.')
+
+    def _capture_state_dict(self):
+        model_copy = copy.deepcopy(self.net).to('cpu')
+        for module in model_copy.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                try:
+                    prune.remove(module, 'weight')
+                except ValueError:
+                    continue
+        return {k: v.detach().cpu() for k, v in model_copy.state_dict().items()}
+
+    def _compose_run_command(self) -> str:
+        parts = [
+            "python main1_pseudoanomaly.py",
+            f"--dataset_name={self.dataset_name}",
+            f"--uvadmode={self.uvadmode}",
+            "--mode=app",
+            f"--seed={self.seed}",
+            f"--run_name={self.run_name}",
+            f"--epochs={self.num_epochs}",
+            f"--batch_size={self.batch_size}",
+            f"--lr={self.optimizer_lr}",
+            f"--num_workers={self.num_workers}",
+            f"--save_root={self.save_root}",
+            f"--log_dir={self.log_dir}",
+            f"--magnitude_prune={self.magnitude_prune}",
+            f"--random_prune={self.random_prune}",
+            f"--device={self.device}",
+        ]
+        if self.random_prune_seed is not None:
+            parts.append(f"--random_prune_seed={self.random_prune_seed}")
+        if self.unprune_epoch is not None:
+            parts.append(f"--unprune_epoch={self.unprune_epoch}")
+        if self.config_path is not None:
+            parts.append(f"--config={self.config_path}")
+        if self.eval_config is not None:
+            parts.append(f"--eval_config={self.eval_config}")
+        if self.eval_interval is not None:
+            parts.append(f"--eval_interval={self.eval_interval}")
+        return ' '.join(str(p) for p in parts)
+
+    def _save_training_artifacts(self):
         if not self.loss_history:
             return
 
-        final_path = self.checkpoint_dir / 'appaerecon_final.pkl'
-        final_state = self._state_dict_to_cpu(self.net.state_dict())
+        final_state = self._capture_state_dict()
+        final_path = self.run_dir / 'appaerecon_final.pkl'
         torch.save(final_state, final_path)
 
         best_path = None
         if self.best_state_dict is not None:
-            best_path = self.checkpoint_dir / 'appaerecon_best.pkl'
+            best_path = self.run_dir / 'appaerecon_best.pkl'
             torch.save(self.best_state_dict, best_path)
+
+        # Compatibility copies
+        shutil.copyfile(final_path, self.run_dir / 'final.pkl')
+        if best_path is not None:
+            shutil.copyfile(best_path, self.run_dir / 'best_auc.pkl')
+
+        log_file = None
+        if self.logger:
+            for handler in self.logger.handlers:
+                if isinstance(handler, logging.FileHandler):
+                    log_file = handler.baseFilename
+                    break
 
         metadata = {
             'timestamp': datetime.utcnow().isoformat() + 'Z',
             'dataset_name': self.dataset_name,
             'uvadmode': self.uvadmode,
+            'run_name': self.run_name,
             'num_epochs': self.num_epochs,
             'batch_size': self.batch_size,
-            'optimizer': 'Adam',
-            'optimizer_lr': self.optimizer_lr,
-            'run_command': (
-                f'python main1_pseudoanomaly.py '
-                f'--dataset_name={self.dataset_name} '
-                f'--uvadmode={self.uvadmode} --mode=app'
-            ),
-            'seeds': {
-                'python_random': 111,
-                'numpy': 111,
-                'torch': 111,
-                'torch_deterministic': True
-            },
+            'num_workers': self.num_workers,
+            'optimizer': self.optimizer_name,
+            'optimizer_lr': float(self.optimizer_lr),
+            'seed': self.seed,
             'device': str(self.device),
             'best_epoch': self.best_epoch,
-            'best_loss': float(best_loss) if best_loss is not None else None,
+            'best_loss': float(self.best_loss) if self.best_loss is not None else None,
             'final_loss': float(self.loss_history[-1]),
             'loss_history': self.loss_history,
             'num_parameters': int(sum(p.numel() for p in self.net.parameters())),
+            'pruning': {
+                'magnitude': self.magnitude_prune,
+                'random': self.random_prune,
+                'random_seed': self.random_prune_seed,
+                'unprune_epoch': self.unprune_epoch,
+            },
+            'evaluation': {
+                'config': str(self.eval_config) if self.eval_config else None,
+                'interval': self.eval_interval,
+                'notes': 'Per-epoch AUROC evaluation not implemented due to compute cost.'
+            },
             'checkpoints': {
                 'best': str(best_path) if best_path else None,
-                'final': str(final_path)
-            }
+                'final': str(final_path),
+                'best_auc': str(self.run_dir / 'best_auc.pkl'),
+                'final_alias': str(self.run_dir / 'final.pkl')
+            },
+            'paths': {
+                'save_root': str(self.save_root),
+                'run_dir': str(self.run_dir),
+                'log_dir': str(self.log_dir),
+                'config_path': str(self.config_path) if self.config_path else None,
+            },
+            'log_file': log_file,
+            'run_command': self._compose_run_command()
         }
 
-        config_path = self.checkpoint_dir / 'appaerecon_training_config.json'
+        config_path = self.run_dir / 'appaerecon_training_config.json'
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(metadata, f, indent=2)
 
-        print(f'[INFO] Saved final checkpoint to {final_path}', flush=True)
+        self._log('Saved final checkpoint to %s', final_path)
         if best_path is not None:
-            print(f'[INFO] Saved best checkpoint (epoch {self.best_epoch}) to {best_path}',
-                  flush=True)
-        print(f'[INFO] Training metadata saved to {config_path}', flush=True)
-
-    @staticmethod
-    def _state_dict_to_cpu(state_dict):
-        return {k: v.detach().cpu() for k, v in state_dict.items()}
+            self._log('Saved best checkpoint (epoch %02d) to %s', self.best_epoch, best_path)
+        self._log('Training metadata saved to %s', config_path)
 
 
 class fGMM(Cleanse):
-    def __init__(self, dataset_name, uvadmode, tr_f, N=12):
+    def __init__(self, dataset_name, uvadmode, tr_f, N=12, logger: Optional[logging.Logger] = None):
         super().__init__(dataset_name, uvadmode)
+        self.logger = logger or logging.getLogger(f'fGMM.{dataset_name}.{uvadmode}')
 
-        print(f'[INFO] Fitting GMM with {tr_f.shape[0]} samples '
-              f'({self.dataset_name}, {self.uvadmode}).', flush=True)
-        print(f'[INFO] Starting GaussianMixture training with {N} components.', flush=True)
+        self._log('Fitting GMM with %d samples (%s, %s).',
+                  tr_f.shape[0], self.dataset_name, self.uvadmode)
+        self._log('Starting GaussianMixture training with %d components.', N)
         self.gmm = GaussianMixture(n_components=N, max_iter=300).fit(tr_f)
 
     def infer(self, tr_f):
-        print(f'[INFO] Inference on {tr_f.shape[0]} samples with trained GMM.', flush=True)
+        self._log('Inference on %d samples with trained GMM.', tr_f.shape[0])
         return -self.gmm.score_samples(tr_f)
+
+    def _log(self, msg, *args):
+        if self.logger:
+            self.logger.info(msg, *args)
+        else:
+            print(msg % args, flush=True)

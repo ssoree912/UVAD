@@ -15,3 +15,20 @@ signals:
 
 postprocess:
   sigma: 5
+
+appaerecon:
+  seed: 111
+  epochs: 10
+  batch_size: 64
+  optimizer_lr: 0.001
+  num_workers: 4
+  save_root: artifacts
+  log_dir: logger
+  device: cuda
+  magnitude_prune: 0.0
+  random_prune: 0.0
+  random_prune_seed:
+  unprune_epoch:
+  eval_config:
+  eval_interval: 0
+  run_name_prefix:
