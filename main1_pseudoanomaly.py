@@ -32,9 +32,11 @@ def main():
     dpath = f'features/{dataset_name}/cleansescores'
 
     if args.mode == 'app':
+        print('[INFO] Launching AppAE reconstruction pipeline.')
         ret = cleanse.AppAErecon(dataset_name, uvadmode).infer()
         fpath = f'{dpath}/{uvadmode}_aerecon_flat.npy'
     elif args.mode == 'mot':
+        print('[INFO] Launching fGMM pseudo anomaly pipeline.')
         tr_f = featurebank.get(dataset_name, 'mot', 'train', uvadmode=uvadmode).astype(np.float32)
         ret = cleanse.fGMM(dataset_name, uvadmode, tr_f, args.gmm_n).infer(tr_f)
         fpath = f'{dpath}/{uvadmode}_velo_fgmm_flat.npy'

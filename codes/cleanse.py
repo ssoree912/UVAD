@@ -124,6 +124,7 @@ class AppAErecon(Cleanse):
                                'Check that patches are placed correctly.')
         print(f'[INFO] AppAE training set size: {len(fpaths)} patches '
               f'({self.dataset_name}, {self.uvadmode}).')
+        print('[INFO] Loading patch tensors into batches...')
         dataset_train = PatchDataset(fpaths)
         loader_train = DataLoader(dataset_train, batch_size=64, shuffle=True, num_workers=4)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -131,10 +132,13 @@ class AppAErecon(Cleanse):
         self.net = AppAE().to(self.device)
         opt = optim.Adam(self.net.parameters())
 
-        for i_epoch in range(1, 11):
+        self.num_epochs = 10
+        print(f'[INFO] Starting AppAE training for {self.num_epochs} epochs.')
+        for i_epoch in range(1, self.num_epochs + 1):
+            print(f'[INFO] Epoch {i_epoch:02d}/{self.num_epochs} running...')
             running_loss = 0.0
             pbar = tqdm(enumerate(loader_train), total=len(loader_train),
-                        desc=f'Training AE. Epoch {i_epoch:2d}', leave=False)
+                        desc=f'Training AE. Epoch {i_epoch:02d}', leave=True, dynamic_ncols=True)
             for i_batch, batch in pbar:
                 xs = batch
                 xs = xs.to(self.device)
@@ -157,11 +161,12 @@ class AppAErecon(Cleanse):
         fpaths = self.get_app_fpaths()
         print(f'[INFO] AppAE inference on {len(fpaths)} patches '
               f'({self.dataset_name}, {self.uvadmode}).')
+        print('[INFO] Beginning inference pass for reconstruction loss estimation.')
         dataset_test = PatchDataset(fpaths)
         loader_train = DataLoader(dataset_test, batch_size=64, shuffle=False, num_workers=4)
         ret = []
         for i_batch, batch in tqdm(enumerate(loader_train), total=len(loader_train),
-                                   desc='Inferring AE scores', leave=False):
+                                   desc='Inferring AE scores', leave=True, dynamic_ncols=True):
             xs = batch
             xs = xs.to(self.device)
 
@@ -180,6 +185,7 @@ class fGMM(Cleanse):
 
         print(f'[INFO] Fitting GMM with {tr_f.shape[0]} samples '
               f'({self.dataset_name}, {self.uvadmode}).')
+        print(f'[INFO] Starting GaussianMixture training with {N} components.')
         self.gmm = GaussianMixture(n_components=N, max_iter=300).fit(tr_f)
 
     def infer(self, tr_f):
