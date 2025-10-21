@@ -1,4 +1,8 @@
 from glob import glob
+import copy
+import json
+from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -117,6 +121,13 @@ class AppAErecon(Cleanse):
     def __init__(self, dataset_name, uvadmode):
         super().__init__(dataset_name, uvadmode)
 
+        self.batch_size = 64
+        self.checkpoint_dir = Path('artifacts') / self.dataset_name / self.uvadmode
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.loss_history = []
+        self.best_state_dict = None
+        self.best_epoch = None
+
         fpaths = self.get_app_fpaths()
         if not fpaths:
             raise RuntimeError(f'No patches found for dataset="{self.dataset_name}" '
@@ -126,19 +137,23 @@ class AppAErecon(Cleanse):
               f'({self.dataset_name}, {self.uvadmode}).', flush=True)
         print('[INFO] Loading patch tensors into batches...', flush=True)
         dataset_train = PatchDataset(fpaths)
-        loader_train = DataLoader(dataset_train, batch_size=64, shuffle=True, num_workers=4)
+        loader_train = DataLoader(dataset_train, batch_size=self.batch_size,
+                                  shuffle=True, num_workers=4)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f'[INFO] Using device: {self.device}', flush=True)
         self.net = AppAE().to(self.device)
         opt = optim.Adam(self.net.parameters())
+        self.optimizer_lr = opt.param_groups[0]['lr']
 
         self.num_epochs = 10
         print(f'[INFO] Starting AppAE training for {self.num_epochs} epochs.', flush=True)
+        best_loss = None
         for i_epoch in range(1, self.num_epochs + 1):
             print(f'[INFO] Epoch {i_epoch:02d}/{self.num_epochs} running...', flush=True)
             running_loss = 0.0
             pbar = tqdm(enumerate(loader_train), total=len(loader_train),
-                        desc=f'Training AE. Epoch {i_epoch:02d}', leave=True, dynamic_ncols=True)
+                        desc=f'Training AE. Epoch {i_epoch:02d}', leave=False,
+                        dynamic_ncols=True, mininterval=1.0, miniters=100)
             for i_batch, batch in pbar:
                 xs = batch
                 xs = xs.to(self.device)
@@ -153,10 +168,20 @@ class AppAErecon(Cleanse):
                 opt.step()
                 loss_value = loss.item()
                 running_loss += loss_value * xs.size(0)
-                pbar.set_postfix(loss=f'{loss_value:.5f}')
+                pbar.set_postfix_str(f'loss={loss_value:.5f}')
             avg_loss = running_loss / len(dataset_train)
             print(f'[INFO] Epoch {i_epoch:02d} average reconstruction loss: {avg_loss:.6f}',
                   flush=True)
+            self.loss_history.append(float(avg_loss))
+            if best_loss is None or avg_loss < best_loss:
+                best_loss = float(avg_loss)
+                self.best_epoch = i_epoch
+                self.best_state_dict = {k: v.detach().cpu().clone()
+                                        for k, v in self.net.state_dict().items()}
+
+        self._save_training_artifacts(best_loss)
+        if self.best_state_dict is not None:
+            self.net.load_state_dict(self.best_state_dict)
 
     def infer(self):
         fpaths = self.get_app_fpaths()
@@ -164,7 +189,8 @@ class AppAErecon(Cleanse):
               f'({self.dataset_name}, {self.uvadmode}).', flush=True)
         print('[INFO] Beginning inference pass for reconstruction loss estimation.', flush=True)
         dataset_test = PatchDataset(fpaths)
-        loader_train = DataLoader(dataset_test, batch_size=64, shuffle=False, num_workers=4)
+        loader_train = DataLoader(dataset_test, batch_size=self.batch_size,
+                                  shuffle=False, num_workers=4)
         ret = []
         for i_batch, batch in tqdm(enumerate(loader_train), total=len(loader_train),
                                    desc='Inferring AE scores', leave=True, dynamic_ncols=True):
@@ -178,6 +204,64 @@ class AppAErecon(Cleanse):
 
         ret = np.concatenate(ret)
         return ret
+
+    def _save_training_artifacts(self, best_loss):
+        if not self.loss_history:
+            return
+
+        final_path = self.checkpoint_dir / 'appaerecon_final.pkl'
+        final_state = self._state_dict_to_cpu(self.net.state_dict())
+        torch.save(final_state, final_path)
+
+        best_path = None
+        if self.best_state_dict is not None:
+            best_path = self.checkpoint_dir / 'appaerecon_best.pkl'
+            torch.save(self.best_state_dict, best_path)
+
+        metadata = {
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'dataset_name': self.dataset_name,
+            'uvadmode': self.uvadmode,
+            'num_epochs': self.num_epochs,
+            'batch_size': self.batch_size,
+            'optimizer': 'Adam',
+            'optimizer_lr': self.optimizer_lr,
+            'run_command': (
+                f'python main1_pseudoanomaly.py '
+                f'--dataset_name={self.dataset_name} '
+                f'--uvadmode={self.uvadmode} --mode=app'
+            ),
+            'seeds': {
+                'python_random': 111,
+                'numpy': 111,
+                'torch': 111,
+                'torch_deterministic': True
+            },
+            'device': str(self.device),
+            'best_epoch': self.best_epoch,
+            'best_loss': float(best_loss) if best_loss is not None else None,
+            'final_loss': float(self.loss_history[-1]),
+            'loss_history': self.loss_history,
+            'num_parameters': int(sum(p.numel() for p in self.net.parameters())),
+            'checkpoints': {
+                'best': str(best_path) if best_path else None,
+                'final': str(final_path)
+            }
+        }
+
+        config_path = self.checkpoint_dir / 'appaerecon_training_config.json'
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f'[INFO] Saved final checkpoint to {final_path}', flush=True)
+        if best_path is not None:
+            print(f'[INFO] Saved best checkpoint (epoch {self.best_epoch}) to {best_path}',
+                  flush=True)
+        print(f'[INFO] Training metadata saved to {config_path}', flush=True)
+
+    @staticmethod
+    def _state_dict_to_cpu(state_dict):
+        return {k: v.detach().cpu() for k, v in state_dict.items()}
 
 
 class fGMM(Cleanse):
