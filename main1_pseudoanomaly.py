@@ -113,6 +113,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help='Run evaluation every N epochs (0 disables).')
     parser.add_argument('--no_stream_logs', action='store_true',
                         help='Disable streaming logs to stdout (file logging remains).')
+    parser.add_argument('--score_output', type=str, default=None,
+                        help='Override output path for AppAE scores when mode=app. '
+                             'You can use placeholders {dataset}, {mode}, {uvadmode}, {run}, {seed}.')
     return parser
 
 
@@ -232,7 +235,16 @@ def main():
             seed=seed,
             config_path=str(config_path) if config_path else None,
         ).infer()
-        fpath = f'{dpath}/{uvadmode}_aerecon_flat.npy'
+        if args.score_output:
+            fpath = args.score_output.format(
+                dataset=dataset_name,
+                mode=args.mode,
+                uvadmode=uvadmode,
+                run=run_name,
+                seed=seed
+            )
+        else:
+            fpath = f'{dpath}/{uvadmode}_aerecon_flat.npy'
     elif args.mode == 'mot':
         logger.info('Launching fGMM pseudo anomaly pipeline.')
         tr_f = featurebank.get(dataset_name, 'mot', 'train', uvadmode=uvadmode).astype(np.float32)
