@@ -27,16 +27,17 @@ def main():
     uvadmode = args.uvadmode
 
     print(f"[INFO] Pseudo anomaly generation started "
-          f"(dataset={dataset_name}, uvadmode={uvadmode}, mode={args.mode})")
+          f"(dataset={dataset_name}, uvadmode={uvadmode}, mode={args.mode})",
+          flush=True)
 
     dpath = f'features/{dataset_name}/cleansescores'
 
     if args.mode == 'app':
-        print('[INFO] Launching AppAE reconstruction pipeline.')
+        print('[INFO] Launching AppAE reconstruction pipeline.', flush=True)
         ret = cleanse.AppAErecon(dataset_name, uvadmode).infer()
         fpath = f'{dpath}/{uvadmode}_aerecon_flat.npy'
     elif args.mode == 'mot':
-        print('[INFO] Launching fGMM pseudo anomaly pipeline.')
+        print('[INFO] Launching fGMM pseudo anomaly pipeline.', flush=True)
         tr_f = featurebank.get(dataset_name, 'mot', 'train', uvadmode=uvadmode).astype(np.float32)
         ret = cleanse.fGMM(dataset_name, uvadmode, tr_f, args.gmm_n).infer(tr_f)
         fpath = f'{dpath}/{uvadmode}_velo_fgmm_flat.npy'
