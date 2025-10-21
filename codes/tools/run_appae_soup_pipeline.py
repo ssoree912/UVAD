@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--skip_inference", action="store_true",
                         help="Skip generating AppAE scores (mode=app).")
-    parser.add_argument("--score_output_template", default="features/{dataset}/cleansescores/{mode}_aerecon_{label}.npy",
+    parser.add_argument("--score_output_template", default="features/{dataset}/cleansescores/{mode}_aerecon_{label}_flat.npy",
                         help="Template for generated AppAE scores. Available placeholders: "
                              "{dataset}, {mode}, {label}, {uvadmode}.")
     parser.add_argument("--inference_batch_size", type=int, default=None,
@@ -180,7 +180,7 @@ def run_appae_inference(dataset_name: str,
                         batch_size: int,
                         num_workers: int,
                         device: torch.device,
-                        logger: logging.Logger):
+                        logger: logging.Logger) -> Path:
     logger.info("Running AppAE inference for soup checkpoint.")
     helper = Cleanse(dataset_name, uvadmode)
     paths = helper.get_app_fpaths()
@@ -212,6 +212,7 @@ def run_appae_inference(dataset_name: str,
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(output_path, np.concatenate(scores))
     logger.info("Saved AppAE scores to %s", output_path)
+    return output_path
 
 
 def run_mot_stage(dataset_name: str,
@@ -243,7 +244,8 @@ def run_mot_stage(dataset_name: str,
 def run_evaluation(dataset_name: str,
                    mode: str,
                    eval_config: str,
-                   logger: logging.Logger) -> Tuple[str, Optional[float]]:
+                   logger: logging.Logger,
+                   override: Optional[str] = None) -> Tuple[str, Optional[float]]:
     logger.info("Running evaluation via main2_evaluate.py.")
     cmd = [
         sys.executable,
@@ -252,6 +254,8 @@ def run_evaluation(dataset_name: str,
         "--dataset_name", dataset_name,
         "--mode", mode,
     ]
+    if override:
+        cmd += ["--override", override]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error("Evaluation failed:\n%s", result.stderr)
@@ -357,6 +361,7 @@ def main():
         "max_batches": args.max_batches,
         "seed": seed,
         "device": str(device),
+        "score_output_template": score_template,
     }
     with open(target_folder / "soup_metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
@@ -433,15 +438,24 @@ def main():
                 device,
                 logger
             )
+            override = json.dumps({
+                "signals": {
+                    "app": {
+                        "cleanse_scorename": f"aerecon_{label}"
+                    }
+                }
+            })
             stdout, auroc = run_evaluation(
                 args.dataset_name,
                 eval_mode,
                 eval_config,
-                logger
+                logger,
+                override=override
             )
             evaluation_summary.append({
                 "label": label,
                 "checkpoint": str(ckpt_path),
+                "score_path": str(scores_path),
                 "auroc": auroc,
                 "raw_output": stdout,
             })
