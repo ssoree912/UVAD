@@ -1,56 +1,31 @@
-# Use NVIDIA CUDA base image for GPU support
-FROM nvidia/cuda:11.3.1-cudnn8-runtime-ubuntu20.04
+# syntax=docker/dockerfile:1
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-ENV LANG=C.UTF-8
-ENV LC_ALL=C.UTF-8
+ARG DEBIAN_FRONTEND=noninteractive
+ARG APT_FORCE_IPV4=false
 
-# Set working directory
-WORKDIR /app
+# 기본 도구 + 런타임 라이브러리
+RUN printf 'Acquire::http::Proxy "false";\nAcquire::https::Proxy "false";\n' > /etc/apt/apt.conf.d/99no-proxy && \
+    apt-get update -o Acquire::ForceIPv4=${APT_FORCE_IPV4} && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl bzip2 \
+      git screen \
+      ffmpeg \
+      libsm6 libxext6 libgl1 && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    python3.7 \
-    python3.7-dev \
-    python3-pip \
-    git \
-    wget \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /workspace
 
-# Set python3.7 as default python
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.7 1 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.7 1
+# Miniforge(Conda) 설치
+RUN curl -fsSL https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -o /tmp/mf.sh && \
+    bash /tmp/mf.sh -b -p /opt/conda && rm /tmp/mf.sh
+ENV PATH=/opt/conda/bin:$PATH
+SHELL ["bash", "-lc"]
 
-# Upgrade pip
-RUN python -m pip install --upgrade pip setuptools wheel
+# Python 3.7 환경 생성 (+ pip/setuptools 호환 버전 고정)
+RUN conda create -y -n py37 python=3.7 && \
+    conda run -n py37 python -V && \
+    conda run -n py37 python -m pip install --upgrade "pip==23.2.1" "setuptools<69" "wheel<0.42"
 
-# Copy requirements file
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy project files
-COPY . .
-
-# Create directories for data if they don't exist
-RUN mkdir -p features/avenue/test features/avenue/train \
-    features/ped2/test features/ped2/train \
-    features/shanghaitech/test features/shanghaitech/train \
-    patches/avenue/test patches/avenue/train \
-    patches/ped2/test patches/ped2/train \
-    patches/shanghaitech/test patches/shanghaitech/train \
-    meta
-
-# Make shell scripts executable
-RUN chmod +x run1_pseudo_anomaly_scores.sh run2_evaluate.sh
-
-# Default command
-CMD ["/bin/bash"]
+# 기본은 쉘로 진입 (요구사항 직접 설치/실행 전제)
+CMD ["bash"]

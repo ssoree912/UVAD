@@ -3,19 +3,17 @@ version: '3.8'
 services:
   cknn:
     build: .
-    image: cknn-pytorch:latest
-    container_name: cknn-anomaly-detection
+    image: solhee0912/vad_soup:3.7
+    container_name: solhee-cknn
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
-      # Mount data directories
-      - ./features:/app/features
-      - ./patches:/app/patches
-      - ./meta:/app/meta
-      # Mount output/results directory
-      - ./results:/app/results
+      # Mount entire project directory for live editing
+      - .:/workspace
+      # This allows you to edit files on your host machine
+      # and see changes immediately inside the container
     working_dir: /app
     stdin_open: true
     tty: true

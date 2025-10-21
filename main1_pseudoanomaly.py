@@ -26,6 +26,9 @@ def main():
     dataset_name = args.dataset_name
     uvadmode = args.uvadmode
 
+    print(f"[INFO] Pseudo anomaly generation started "
+          f"(dataset={dataset_name}, uvadmode={uvadmode}, mode={args.mode})")
+
     dpath = f'features/{dataset_name}/cleansescores'
 
     if args.mode == 'app':

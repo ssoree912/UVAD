@@ -1,6 +1,7 @@
 from glob import glob
 
 import numpy as np
+import torch
 import torch.optim as optim
 from sklearn.mixture import GaussianMixture
 from torch.utils.data import Dataset, DataLoader
@@ -117,16 +118,26 @@ class AppAErecon(Cleanse):
         super().__init__(dataset_name, uvadmode)
 
         fpaths = self.get_app_fpaths()
+        if not fpaths:
+            raise RuntimeError(f'No patches found for dataset="{self.dataset_name}" '
+                               f'and uvadmode="{self.uvadmode}". '
+                               'Check that patches are placed correctly.')
+        print(f'[INFO] AppAE training set size: {len(fpaths)} patches '
+              f'({self.dataset_name}, {self.uvadmode}).')
         dataset_train = PatchDataset(fpaths)
         loader_train = DataLoader(dataset_train, batch_size=64, shuffle=True, num_workers=4)
-        self.net = AppAE().cuda()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f'[INFO] Using device: {self.device}')
+        self.net = AppAE().to(self.device)
         opt = optim.Adam(self.net.parameters())
 
         for i_epoch in range(1, 11):
-            for i_batch, batch in tqdm(enumerate(loader_train), total=len(loader_train),
-                                       desc=f'Training AE. Epoch {i_epoch:2d}', leave=False):
+            running_loss = 0.0
+            pbar = tqdm(enumerate(loader_train), total=len(loader_train),
+                        desc=f'Training AE. Epoch {i_epoch:2d}', leave=False)
+            for i_batch, batch in pbar:
                 xs = batch
-                xs = xs.cuda()
+                xs = xs.to(self.device)
 
                 opt.zero_grad()
 
@@ -136,15 +147,23 @@ class AppAErecon(Cleanse):
                 loss.backward()
 
                 opt.step()
+                loss_value = loss.item()
+                running_loss += loss_value * xs.size(0)
+                pbar.set_postfix(loss=f'{loss_value:.5f}')
+            avg_loss = running_loss / len(dataset_train)
+            print(f'[INFO] Epoch {i_epoch:02d} average reconstruction loss: {avg_loss:.6f}')
 
     def infer(self):
         fpaths = self.get_app_fpaths()
+        print(f'[INFO] AppAE inference on {len(fpaths)} patches '
+              f'({self.dataset_name}, {self.uvadmode}).')
         dataset_test = PatchDataset(fpaths)
         loader_train = DataLoader(dataset_test, batch_size=64, shuffle=False, num_workers=4)
         ret = []
-        for i_batch, batch in tqdm(enumerate(loader_train), total=len(loader_train)):
+        for i_batch, batch in tqdm(enumerate(loader_train), total=len(loader_train),
+                                   desc='Inferring AE scores', leave=False):
             xs = batch
-            xs = xs.cuda()
+            xs = xs.to(self.device)
 
             xhs = self.net(xs)
             loss = (xhs - xs) ** 2
@@ -159,7 +178,10 @@ class fGMM(Cleanse):
     def __init__(self, dataset_name, uvadmode, tr_f, N=12):
         super().__init__(dataset_name, uvadmode)
 
+        print(f'[INFO] Fitting GMM with {tr_f.shape[0]} samples '
+              f'({self.dataset_name}, {self.uvadmode}).')
         self.gmm = GaussianMixture(n_components=N, max_iter=300).fit(tr_f)
 
     def infer(self, tr_f):
+        print(f'[INFO] Inference on {tr_f.shape[0]} samples with trained GMM.')
         return -self.gmm.score_samples(tr_f)
