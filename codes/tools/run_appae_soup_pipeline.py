@@ -61,7 +61,13 @@ def parse_args() -> argparse.Namespace:
                         help="Overwrite existing checkpoint in target folder.")
 
     parser.add_argument("--coefficients", type=str, default=None,
-                        help="Comma-separated coefficients for soup (default: uniform).")
+                        help="Comma-separated coefficients for soup (when provided, overrides strategy).")
+    parser.add_argument("--soup_strategy", choices=["uniform", "grid", "random"], default="uniform",
+                        help="Coefficient search strategy when --coefficients is not provided.")
+    parser.add_argument("--soup_n_combinations", type=int, default=10,
+                        help="Number of coefficient candidates to try for grid/random strategies.")
+    parser.add_argument("--soup_random_seed", type=int, default=42,
+                        help="Random seed for coefficient generation.")
     parser.add_argument("--subset", type=int, default=None,
                         help="Optional number of patches sampled for Fisher computation.")
     parser.add_argument("--batch_size", type=int, default=None,
@@ -120,16 +126,44 @@ def setup_logger(verbose: bool) -> logging.Logger:
     return logger
 
 
-def parse_coefficients(raw: Optional[str], n: int) -> List[float]:
-    if raw:
-        coeffs = [float(x.strip()) for x in raw.split(",")]
-        if len(coeffs) != n:
-            raise ValueError("Number of coefficients must match number of folders.")
-        total = sum(coeffs)
-        if total == 0:
-            raise ValueError("Coefficient sum must be non-zero.")
-        return [c / total for c in coeffs]
-    return [1.0 / n] * n
+def parse_coefficients(raw: Optional[str], n: int) -> Optional[List[float]]:
+    if not raw:
+        return None
+    coeffs = [float(x.strip()) for x in raw.split(",")]
+    if len(coeffs) != n:
+        raise ValueError("Number of coefficients must match number of folders.")
+    total = sum(coeffs)
+    if total == 0:
+        raise ValueError("Coefficient sum must be non-zero.")
+    return [c / total for c in coeffs]
+
+
+def generate_coefficients(strategy: str,
+                          n_models: int,
+                          n_combinations: int,
+                          random_seed: int) -> List[List[float]]:
+    if n_models == 0:
+        raise ValueError("At least one model is required.")
+
+    if strategy == "uniform":
+        return [[1.0 / n_models] * n_models]
+
+    rng = np.random.default_rng(random_seed)
+
+    if strategy == "grid" and n_models == 2:
+        if n_combinations < 2:
+            n_combinations = 2
+        combos = []
+        for i in range(n_combinations + 1):
+            a = i / n_combinations
+            combos.append([a, 1.0 - a])
+        return combos
+
+    combos = []
+    for _ in range(max(n_combinations, 1)):
+        vec = rng.dirichlet(np.ones(n_models))
+        combos.append(vec.tolist())
+    return combos
 
 
 def ensure_fisher(folder: Path,
@@ -292,6 +326,9 @@ def main():
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    eval_config_path = args.eval_config or (str(config_path) if config_path else None)
+    eval_mode_default = args.eval_mode or args.uvadmode
+
     logger.info("Dataset: %s | UVAD mode: %s | Device: %s", args.dataset_name, args.uvadmode, device)
     if config_path:
         logger.info("Training config: %s", config_path)
@@ -329,10 +366,6 @@ def main():
         )
         fisher_dicts.append(fisher)
 
-    coefficients = parse_coefficients(args.coefficients, len(folders))
-    logger.info("Soup coefficients: %s", coefficients)
-    merged_state = fisher_weighted_average(state_dicts, fisher_dicts, coefficients, eps=args.eps)
-
     target_folder = Path(args.target_folder) if args.target_folder else (
         Path(cfg.save_root) / args.dataset_name / args.uvadmode / "soup_run"
     )
@@ -345,10 +378,128 @@ def main():
         raise FileExistsError(f"Output checkpoint already exists: {output_checkpoint} "
                               "(use --overwrite_target to overwrite).")
 
-    torch.save(merged_state, output_checkpoint)
-    logger.info("Saved merged checkpoint to %s", output_checkpoint)
-
     score_template = args.score_output_template
+    inference_batch_size = args.inference_batch_size or batch_size
+    inference_workers = args.inference_workers or num_workers
+
+    mot_score_path = Path("features") / args.dataset_name / "cleansescores" / f"{args.uvadmode}_velo_fgmm_flat.npy"
+    mot_scores_ready = mot_score_path.exists()
+
+    manual_coeffs = parse_coefficients(args.coefficients, len(folders))
+    if manual_coeffs is not None:
+        coefficient_candidates = [manual_coeffs]
+        logger.info("Using user-specified coefficients: %s", manual_coeffs)
+    else:
+        coefficient_candidates = generate_coefficients(
+            args.soup_strategy,
+            len(folders),
+            args.soup_n_combinations,
+            args.soup_random_seed,
+        )
+        logger.info("Generated %d coefficient candidate(s) using %s strategy.",
+                    len(coefficient_candidates), args.soup_strategy)
+
+    candidate_evaluations: List[dict] = []
+    temp_checkpoints: List[Path] = []
+    best_state = None
+    best_coeffs = None
+    best_label = None
+    best_auroc = None
+    best_stdout = None
+
+    needs_search = len(coefficient_candidates) > 1 and args.run_eval
+
+    if needs_search and not eval_config_path:
+        raise ValueError("Coefficient search requires an evaluation config. Provide --eval_config or ensure the training config can be used.")
+
+    if args.run_eval and not mot_scores_ready:
+        logger.info("MOT scores not found; computing once for evaluation.")
+        run_mot_stage(
+            args.dataset_name,
+            args.uvadmode,
+            seed,
+            cfg.save_root,
+            cfg.log_dir,
+            args.mot_gmm_n,
+            logger
+        )
+        mot_scores_ready = True
+
+    if not needs_search:
+        best_coeffs = coefficient_candidates[0]
+        best_state = fisher_weighted_average(state_dicts, fisher_dicts, best_coeffs, eps=args.eps)
+    else:
+        logger.info("Evaluating coefficient candidates...")
+        for idx, coeffs in enumerate(coefficient_candidates):
+            state = fisher_weighted_average(state_dicts, fisher_dicts, coeffs, eps=args.eps)
+            candidate_label = f"{Path(target_folder).name}_cand{idx}"
+            candidate_checkpoint = target_folder / f"_candidate_{idx}.pkl"
+            torch.save(state, candidate_checkpoint)
+            temp_checkpoints.append(candidate_checkpoint)
+
+            score_path_str = score_template.format(
+                dataset=args.dataset_name,
+                mode=eval_mode_default,
+                label=candidate_label,
+                uvadmode=args.uvadmode
+            )
+            scores_path = Path(score_path_str)
+            run_appae_inference(
+                args.dataset_name,
+                args.uvadmode,
+                candidate_checkpoint,
+                scores_path,
+                inference_batch_size,
+                inference_workers,
+                device,
+                logger
+            )
+            override = json.dumps({
+                "signals": {
+                    "app": {
+                        "cleanse_scorename": f"aerecon_{candidate_label}"
+                    }
+                }
+            })
+            stdout, auroc = run_evaluation(
+                args.dataset_name,
+                eval_mode_default,
+                eval_config_path,
+                logger,
+                override=override
+            )
+            candidate_evaluations.append({
+                "label": candidate_label,
+                "coefficients": coeffs,
+                "checkpoint": str(candidate_checkpoint),
+                "score_path": str(scores_path),
+                "auroc": auroc,
+                "raw_output": stdout,
+            })
+            if best_auroc is None or (auroc is not None and auroc > best_auroc):
+                best_state = state
+                best_coeffs = coeffs
+                best_label = candidate_label
+                best_auroc = auroc
+                best_stdout = stdout
+
+        if best_state is None:
+            best_state = fisher_weighted_average(state_dicts, fisher_dicts,
+                                                 coefficient_candidates[0], eps=args.eps)
+            best_coeffs = coefficient_candidates[0]
+
+    if temp_checkpoints:
+        for tmp in temp_checkpoints:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    torch.save(best_state, output_checkpoint)
+    logger.info("Saved merged checkpoint to %s", output_checkpoint)
+    logger.info("Selected soup coefficients: %s", best_coeffs)
+    if best_auroc is not None:
+        logger.info("Best candidate AUROC: %.6f", best_auroc)
 
     metadata = {
         "dataset_name": args.dataset_name,
@@ -364,15 +515,18 @@ def main():
         "seed": seed,
         "device": str(device),
         "score_output_template": score_template,
+        "selected_coefficients": best_coeffs,
+        "selected_label": best_label,
+        "selected_auroc": best_auroc,
     }
+    if candidate_evaluations:
+        metadata["candidate_evaluations"] = candidate_evaluations
     with open(target_folder / "soup_metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
 
     score_template = args.score_output_template
 
     if not args.skip_inference:
-        inference_batch_size = args.inference_batch_size or batch_size
-        inference_workers = args.inference_workers or num_workers
         label = Path(target_folder).name
         score_path_str = score_template.format(
             dataset=args.dataset_name,
@@ -393,6 +547,9 @@ def main():
         )
 
     evaluation_summary = []
+    if candidate_evaluations:
+        for item in candidate_evaluations:
+            evaluation_summary.append({**item, "type": "candidate"})
 
     if args.run_mot:
         run_mot_stage(
@@ -406,10 +563,9 @@ def main():
         )
 
     if args.run_eval:
-        eval_config = args.eval_config or (str(config_path) if config_path else None)
-        if not eval_config:
+        if not eval_config_path:
             raise ValueError("Evaluation requested but no config provided (use --eval_config).")
-        eval_mode = args.eval_mode or args.uvadmode
+        eval_mode = eval_mode_default
 
         evaluation_targets: List[Tuple[str, Path]] = []
         if args.eval_include_folders:
@@ -418,9 +574,8 @@ def main():
                 evaluation_targets.append((label, folder / args.checkpoint_name))
         evaluation_targets.append((Path(target_folder).name, output_checkpoint))
 
-        inference_batch_size = args.inference_batch_size or batch_size
-        inference_workers = args.inference_workers or num_workers
 
+        soup_label = Path(target_folder).name
         for label, ckpt_path in evaluation_targets:
             logger.info("Evaluating run '%s' using checkpoint %s", label, ckpt_path)
             score_path_str = score_template.format(
@@ -450,22 +605,26 @@ def main():
             stdout, auroc = run_evaluation(
                 args.dataset_name,
                 eval_mode,
-                eval_config,
+                eval_config_path,
                 logger,
                 override=override
             )
+            summary_type = "soup" if label == soup_label else "run"
             evaluation_summary.append({
                 "label": label,
                 "checkpoint": str(ckpt_path),
                 "score_path": str(scores_path),
                 "auroc": auroc,
                 "raw_output": stdout,
+                "type": summary_type,
             })
 
     if evaluation_summary:
         logger.info("Evaluation summary:")
         for item in evaluation_summary:
-            logger.info("  %s -> AUROC: %s", item["label"],
+            logger.info("  [%s] %s -> AUROC: %s",
+                        item.get("type", "run"),
+                        item["label"],
                         f"{item['auroc']:.3f}" if item["auroc"] is not None else "N/A")
         with open(target_folder / "evaluation_summary.json", "w", encoding="utf-8") as handle:
             json.dump(evaluation_summary, handle, indent=2)

@@ -317,6 +317,23 @@ class AppAErecon(Cleanse):
                         copy_m.bias.data.copy_(orig.bias.detach().cpu())
 
         return {k: v.detach().cpu() for k, v in model_copy.state_dict().items()}
+    
+    def _extract_pruning_masks(self) -> Optional[dict]:
+        """Extract pruning masks from the current model state."""
+        masks = {}
+        has_masks = False
+        
+        for name, module in self.net.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+                # Check if this module has pruning masks
+                if hasattr(module, 'weight_mask'):
+                    masks[f'{name}.weight'] = module.weight_mask.detach().cpu().clone()
+                    has_masks = True
+                if hasattr(module, 'bias_mask') and module.bias is not None:
+                    masks[f'{name}.bias'] = module.bias_mask.detach().cpu().clone()
+                    has_masks = True
+        
+        return masks if has_masks else None
 
     def _compose_run_command(self) -> str:
         parts = [
@@ -361,10 +378,27 @@ class AppAErecon(Cleanse):
             best_path = self.run_dir / 'appaerecon_best.pkl'
             torch.save(self.best_state_dict, best_path)
 
+        # Extract and save pruning masks if they exist
+        masks = self._extract_pruning_masks()
+        if masks is not None:
+            final_mask_path = str(final_path) + '.mask'
+            torch.save(masks, final_mask_path)
+            self._log('Saved pruning masks to %s', final_mask_path)
+            
+            if best_path is not None:
+                best_mask_path = str(best_path) + '.mask'
+                torch.save(masks, best_mask_path)
+                self._log('Saved pruning masks to %s', best_mask_path)
+
         # Compatibility copies
         shutil.copyfile(final_path, self.run_dir / 'final.pkl')
         if best_path is not None:
             shutil.copyfile(best_path, self.run_dir / 'best_auc.pkl')
+            # Also copy mask for compatibility checkpoint
+            if masks is not None:
+                final_mask_path = str(final_path) + '.mask'
+                best_auc_mask_path = str(self.run_dir / 'best_auc.pkl') + '.mask'
+                shutil.copyfile(final_mask_path, best_auc_mask_path)
 
         log_file = None
         if self.logger:
