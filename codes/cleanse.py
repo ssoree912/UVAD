@@ -250,6 +250,9 @@ class AppAErecon(Cleanse):
             self.best_loss = float(self.loss_history[-1])
 
         self._save_training_artifacts()
+        # Remove pruning reparameterizations before loading the best state dict
+        # so that state_dict keys (without _orig/_mask) match the saved weights.
+        self._remove_pruning()
         if self.best_state_dict is not None:
             self.net.load_state_dict(self.best_state_dict)
 
