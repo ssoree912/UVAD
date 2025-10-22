@@ -159,6 +159,7 @@ class AppAErecon(Cleanse):
         self.best_epoch = None
         self.best_loss = None
         self.seed = seed
+        self.stored_masks = None  # Store masks before unpruning
 
         self.magnitude_prune = magnitude_prune
         self.random_prune = random_prune
@@ -237,6 +238,10 @@ class AppAErecon(Cleanse):
 
             if self.unprune_epoch is not None and i_epoch == self.unprune_epoch:
                 self._log('Unpruning network parameters at epoch %02d.', i_epoch)
+                # Store masks before unpruning (like VAD_soup)
+                self.stored_masks = self._extract_pruning_masks()
+                if self.stored_masks:
+                    self._log('Stored %d pruning masks before unpruning.', len(self.stored_masks))
                 self._remove_pruning()
 
         if self.best_state_dict is None:
@@ -379,7 +384,8 @@ class AppAErecon(Cleanse):
             torch.save(self.best_state_dict, best_path)
 
         # Extract and save pruning masks if they exist
-        masks = self._extract_pruning_masks()
+        # Use stored masks if available (after unpruning), otherwise extract current masks
+        masks = self.stored_masks if self.stored_masks is not None else self._extract_pruning_masks()
         if masks is not None:
             final_mask_path = str(final_path) + '.mask'
             torch.save(masks, final_mask_path)
