@@ -547,7 +547,57 @@ def main():
         )
 
     if args.run_eval and eval_config_path:
-        # Final evaluation
+        evaluation_results = []
+        
+        # Evaluate individual folders if requested
+        if args.eval_include_folders:
+            logger.info("Evaluating individual folders...")
+            for folder in folders:
+                folder_name = Path(folder).name
+                individual_checkpoint = Path(folder) / args.checkpoint_name
+                
+                if individual_checkpoint.exists():
+                    # Generate scores for individual model
+                    individual_score_path_str = args.score_output_template.format(
+                        dataset=args.dataset_name,
+                        mode=eval_mode_default,
+                        label=folder_name,
+                        uvadmode=args.uvadmode
+                    )
+                    individual_scores_path = Path(individual_score_path_str)
+                    
+                    run_appae_inference(
+                        args.dataset_name, eval_mode_default, individual_checkpoint,
+                        individual_scores_path, inference_batch_size, inference_workers,
+                        device, logger
+                    )
+                    
+                    # Evaluate individual model
+                    override = json.dumps({
+                        "signals": {
+                            "app": {
+                                "cleanse_scorename": f"aerecon_{folder_name}"
+                            }
+                        }
+                    })
+                    
+                    stdout, individual_auroc = run_evaluation(
+                        args.dataset_name, eval_mode_default, eval_config_path,
+                        logger, override=override
+                    )
+                    
+                    evaluation_results.append({
+                        "label": folder_name,
+                        "checkpoint": str(individual_checkpoint),
+                        "score_path": str(individual_scores_path),
+                        "auroc": individual_auroc,
+                        "raw_output": stdout.strip() if stdout else None
+                    })
+                    
+                    if individual_auroc is not None:
+                        logger.info("Individual %s AUROC: %.6f", folder_name, individual_auroc)
+        
+        # Evaluate soup model
         label = Path(target_folder).name
         score_path_str = args.score_output_template.format(
             dataset=args.dataset_name,
@@ -576,8 +626,22 @@ def main():
             logger, override=override
         )
         
+        evaluation_results.append({
+            "label": "soup_model",
+            "checkpoint": str(output_checkpoint),
+            "score_path": str(scores_path),
+            "auroc": final_auroc,
+            "raw_output": stdout.strip() if stdout else None
+        })
+        
         if final_auroc is not None:
-            logger.info("Final AUROC: %.6f", final_auroc)
+            logger.info("Soup model AUROC: %.6f", final_auroc)
+        
+        # Save evaluation results
+        eval_results_path = target_folder / "evaluation_results.json"
+        with open(eval_results_path, "w", encoding="utf-8") as handle:
+            json.dump(evaluation_results, handle, indent=2)
+        logger.info("Saved evaluation results to %s", eval_results_path)
 
     logger.info("Enhanced AppAE soup pipeline completed successfully!")
 
