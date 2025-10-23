@@ -50,19 +50,20 @@ class KNNGrader(ABCGrader):
             if self.gpu_ids:
                 try:
                     if self.multi_gpu:
-                        self.res_list = [faiss.StandardGpuResources() for _ in self.gpu_ids]
-                        for r in self.res_list:
-                            if hasattr(r, 'setTempMemory'):
-                                r.setTempMemory(temp_memory_mb * 1024 * 1024)
+                        self.res_list = []
+                        res_vec = faiss.GpuResourcesVector()
+                        dev_vec = faiss.IntVector()
+                        for gid in self.gpu_ids:
+                            res = faiss.StandardGpuResources()
+                            if hasattr(res, 'setTempMemory'):
+                                res.setTempMemory(temp_memory_mb * 1024 * 1024)
+                            self.res_list.append(res)
+                            res_vec.push_back(res)
+                            dev_vec.push_back(int(gid))
                         co = faiss.GpuMultipleClonerOptions()
                         co.shard = True
                         co.useFloat16 = False
-                        self.index = faiss.index_cpu_to_gpu_multiple_py(
-                            self.res_list,
-                            [int(g) for g in self.gpu_ids],
-                            cpu_index,
-                            co
-                        )
+                        self.index = faiss.index_cpu_to_gpu_multiple(res_vec, dev_vec, cpu_index, co)
                     else:
                         gpu_id = int(self.gpu_ids[0])
                         self.res = faiss.StandardGpuResources()
@@ -84,7 +85,7 @@ class KNNGrader(ABCGrader):
                         key, e
                     )
                     self.res = None
-                    self.res_list = None
+                    self.res_list = []
                     self.use_gpu = False
                     self.multi_gpu = False
                     self.index = faiss.IndexFlatL2(self.dim)
@@ -103,60 +104,8 @@ class KNNGrader(ABCGrader):
             pass
 
     def grade_flat(self, te_x):  # [M, D]
-        te_x = np.ascontiguousarray(te_x, dtype=np.float32)  # 연속/float32 보장
-
-        B = 256  # 배치 크기는 256 권장 (128~512 범위)
-        ALIGN = 32  # 32의 배수로 패딩
-        all_distances = []
-
-        for i in range(0, len(te_x), B):
-            batch = te_x[i:i + B]
-            m = len(batch)
-            
-            # 32의 배수로 패딩 (마지막 배치 포함)
-            pad = (-m) % ALIGN
-            if pad:
-                pad_block = np.repeat(batch[-1:], pad, axis=0)
-                batch_padded = np.vstack([batch, pad_block])
-            else:
-                batch_padded = batch
-
-            try:
-                # 반드시 연속 메모리로 보장
-                batch_padded = np.ascontiguousarray(batch_padded, dtype=np.float32)
-                Ds, _ = self.index.search(batch_padded, self.K + 1)
-                Ds = Ds[:m]  # 패딩 자르기
-                all_distances.append(Ds)
-                
-            except RuntimeError as e:
-                if 'CUBLAS' in str(e) or 'cuBLAS' in str(e):
-                    logging.warning(f"[{self.key}] cuBLAS fail at i={i}, falling back to CPU for this chunk")
-                    
-                    # CPU 인덱스 준비 (1회만)
-                    if not hasattr(self, '_cpu_index'):
-                        self._cpu_index = faiss.IndexFlatL2(self.tr_x_dim)
-                        self._cpu_index.add(self.tr_x_cpu)
-                        logging.info(f"[{self.key}] Created emergency CPU index")
-                    
-                    # 패딩 없이 원본 배치를 CPU로 처리
-                    Ds_cpu, _ = self._cpu_index.search(batch, self.K + 1)
-                    all_distances.append(Ds_cpu)
-                    
-                elif 'cuda' in str(e).lower():
-                    # GPU 완전 실패 시 영구 CPU로 전환
-                    logging.warning(f"[{self.key}] GPU completely failed, switching to CPU permanently")
-                    self.index = faiss.IndexFlatL2(self.tr_x_dim)
-                    self.index.add(self.tr_x_cpu)
-                    self.use_gpu = False
-                    
-                    # 현재 배치부터 CPU로 계속 처리
-                    Ds_cpu, _ = self.index.search(batch, self.K + 1)
-                    all_distances.append(Ds_cpu)
-                else:
-                    raise
-
-        # 모든 배치 결과 연결
-        Ds = np.concatenate(all_distances, axis=0)
+        te_x = np.ascontiguousarray(te_x.astype(np.float32))
+        Ds, _ = self.index.search(te_x, self.K + 1)
         
         ret = []
         for vs in Ds:
