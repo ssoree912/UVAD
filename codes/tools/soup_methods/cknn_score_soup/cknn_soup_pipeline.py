@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from codes.tools import featurebank, grader
+from codes import featurebank, grader
 from codes.tools.soup_methods.cknn_score_soup.knn_score_ensemble import KNNScoreEnsemble, create_multi_cleansing_pipeline
 try:
     from codes.tools.utils import load_config, task
@@ -85,6 +85,72 @@ def load_cleansed_features(dataset_name: str, uvadmode: str,
     tr_f_cleansed = tr_f[mask]
     
     return tr_f_cleansed, te_f
+
+
+def apply_coreset_sampling(features: np.ndarray, max_samples: int, 
+                          method: str = "random", seed: int = 42) -> np.ndarray:
+    """
+    Apply coreset sampling to reduce training features
+    
+    Args:
+        features: Training features array
+        max_samples: Maximum number of samples to keep
+        method: Sampling method ("random", "kmeans", "farthest")
+        seed: Random seed
+        
+    Returns:
+        Sampled features
+    """
+    if len(features) <= max_samples:
+        return features
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Applying {method} coreset: {len(features):,} -> {max_samples:,} samples")
+    
+    if method == "random":
+        # Simple random sampling
+        np.random.seed(seed)
+        indices = np.random.choice(len(features), size=max_samples, replace=False)
+        return features[indices]
+    
+    elif method == "kmeans":
+        # K-means clustering and take centroids
+        try:
+            from sklearn.cluster import MiniBatchKMeans
+            kmeans = MiniBatchKMeans(n_clusters=max_samples, random_state=seed, batch_size=10000)
+            kmeans.fit(features)
+            return kmeans.cluster_centers_.astype(features.dtype)
+        except ImportError:
+            logger.warning("scikit-learn not available, falling back to random sampling")
+            return apply_coreset_sampling(features, max_samples, "random", seed)
+    
+    elif method == "farthest":
+        # Farthest point sampling (greedy)
+        np.random.seed(seed)
+        n_samples = len(features)
+        
+        # Start with random point
+        selected_indices = [np.random.randint(n_samples)]
+        
+        for _ in range(max_samples - 1):
+            distances = []
+            for i in range(n_samples):
+                if i in selected_indices:
+                    distances.append(0)
+                else:
+                    # Distance to nearest selected point
+                    min_dist = min(np.linalg.norm(features[i] - features[j]) 
+                                 for j in selected_indices)
+                    distances.append(min_dist)
+            
+            # Select point farthest from selected points
+            farthest_idx = np.argmax(distances)
+            selected_indices.append(farthest_idx)
+        
+        return features[selected_indices]
+    
+    else:
+        raise ValueError(f"Unknown coreset method: {method}")
 
 
 def load_test_labels(dataset_name: str, uvadmode: str) -> np.ndarray:
@@ -156,6 +222,9 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
                            cleanse_thresholds: List[float],
                            k_values: List[int],
                            feature_type: str = 'app',
+                           max_train_samples: int = 500000,
+                           coreset_method: str = "random",
+                           multi_gpu: bool = False,
                            logger: Optional[logging.Logger] = None) -> List[Dict]:
     """
     Create multiple KNN grader variations
@@ -167,6 +236,9 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
         cleanse_thresholds: List of cleansing percentiles
         k_values: List of k values for k-NN
         feature_type: Feature type ('app' or 'mot')
+        max_train_samples: Maximum training samples per grader
+        coreset_method: Method for coreset sampling
+        multi_gpu: Use multi-GPU grader
         logger: Optional logger
         
     Returns:
@@ -187,11 +259,25 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
                         dataset_name, uvadmode, cleanse_scorename, threshold, feature_type
                     )
                     
-                    # Create grader
-                    gr = grader.KNNGrader(tr_f_cleansed, K=k, key=f'{feature_type}_{appae_var}')
+                    # Apply coreset sampling if needed
+                    original_size = len(tr_f_cleansed)
+                    if len(tr_f_cleansed) > max_train_samples:
+                        tr_f_cleansed = apply_coreset_sampling(
+                            tr_f_cleansed, max_train_samples, coreset_method
+                        )
+                        logger.info(f"Coreset applied: {original_size:,} -> {len(tr_f_cleansed):,}")
                     
-                    # Compute quality metrics
-                    keep_ratio = len(tr_f_cleansed) / len(featurebank.get(dataset_name, feature_type, 'train', uvadmode))
+                    # Create grader (MultiGPU or standard)
+                    if multi_gpu:
+                        # TODO: Implement MultiGPUKNNGrader
+                        logger.warning("Multi-GPU not implemented yet, using standard grader")
+                        gr = grader.KNNGrader(tr_f_cleansed, K=k, key=f'{feature_type}_{appae_var}')
+                    else:
+                        gr = grader.KNNGrader(tr_f_cleansed, K=k, key=f'{feature_type}_{appae_var}')
+                    
+                    # Compute quality metrics based on original cleansed size
+                    total_train = len(featurebank.get(dataset_name, feature_type, 'train', uvadmode))
+                    keep_ratio = original_size / total_train  # Use original size before coreset
                     
                     variation = {
                         'grader': gr,
@@ -225,6 +311,9 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
                             feature_types: List[str] = ['app'],
                             weight_method: str = "keep_ratio",
                             output_dir: Optional[Path] = None,
+                            max_train_samples: int = 500000,
+                            coreset_method: str = "random",
+                            multi_gpu: bool = False,
                             logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """
     Run complete CKNN score ensemble evaluation
@@ -276,7 +365,8 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         # Create grader variations
         variations = create_grader_variations(
             dataset_name, uvadmode, appae_variations, cleanse_thresholds, 
-            k_values, feature_type, logger
+            k_values, feature_type, args.max_train_samples, args.coreset_method,
+            args.multi_gpu, logger
         )
         
         if not variations:
@@ -454,6 +544,12 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--gpu", type=int, default=None, 
                        help="GPU device ID (e.g., 0, 1, 2). If not specified, uses CPU or auto-detects GPU.")
+    parser.add_argument("--max_train_samples", type=int, default=500000,
+                       help="Max training samples per KNN grader (reduces GPU memory usage)")
+    parser.add_argument("--coreset_method", choices=["random", "kmeans", "farthest"], default="random",
+                       help="Method for selecting coreset when reducing training samples")
+    parser.add_argument("--multi_gpu", action="store_true",
+                       help="Use multiple GPUs for KNN graders (experimental)")
     
     args = parser.parse_args()
     
@@ -486,6 +582,9 @@ def main():
             feature_types=args.feature_types,
             weight_method=args.weight_method,
             output_dir=Path(args.output_dir) if args.output_dir else None,
+            max_train_samples=args.max_train_samples,
+            coreset_method=args.coreset_method,
+            multi_gpu=args.multi_gpu,
             logger=logger
         )
         

@@ -1,4 +1,5 @@
 from abc import abstractmethod
+import logging
 
 import faiss
 import numpy as np
@@ -34,12 +35,26 @@ class KNNGrader(ABCGrader):
         super().__init__(key)
         self.K = K
         self.tr_x = tr_x
+        self.use_gpu = False
 
         with task('Building KNN index', debug=True):
-            self.res = faiss.StandardGpuResources()
-            self.index = faiss.IndexFlatL2(tr_x.shape[1])
-            self.index = faiss.index_cpu_to_gpu(self.res, 0, self.index)
-            self.index.add(tr_x.astype(np.float32))
+            try:
+                self.res = faiss.StandardGpuResources()
+                self.index = faiss.IndexFlatL2(tr_x.shape[1])
+                self.index = faiss.index_cpu_to_gpu(self.res, 0, self.index)
+                self.index.add(tr_x.astype(np.float32))
+                self.use_gpu = True
+            except RuntimeError as e:
+                if 'cudaMalloc' in str(e):
+                    logging.warning(
+                        "[%s] GPU allocation failed (%s); falling back to CPU Faiss index.",
+                        key, e
+                    )
+                    self.res = None
+                    self.index = faiss.IndexFlatL2(tr_x.shape[1])
+                    self.index.add(tr_x.astype(np.float32))
+                else:
+                    raise
 
     def grade_flat(self, te_x):  # [M, D]
         Ds, _ = self.index.search(te_x.astype(np.float32), self.K + 1)
