@@ -313,6 +313,11 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
         max_train_samples: Maximum training samples per grader
         coreset_method: Method for coreset sampling
         gpu_ids: GPUs to use for KNN (None for CPU)
+        faiss_temp_mb: Faiss temporary memory buffer size in MB
+        use_ivf: Whether to use IVF-Flat index for memory efficiency
+        ivf_nlist: Number of clusters for IVF index
+        ivf_nprobe: Number of clusters to search in IVF index
+        use_float16: Whether to use float16 precision
         logger: Optional logger
         
     Returns:
@@ -421,6 +426,11 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         weight_method: Method for computing quality weights
         output_dir: Output directory for results
         gpu_ids: List of GPU IDs to use (None for CPU)
+        faiss_temp_mb: Faiss temporary memory buffer size in MB
+        use_ivf: Whether to use IVF-Flat index for memory efficiency
+        ivf_nlist: Number of clusters for IVF index
+        ivf_nprobe: Number of clusters to search in IVF index
+        use_float16: Whether to use float16 precision
         logger: Optional logger
         
     Returns:
