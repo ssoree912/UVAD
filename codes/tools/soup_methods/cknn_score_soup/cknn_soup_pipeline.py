@@ -10,9 +10,20 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 
-from . import featurebank, grader
-from .knn_score_ensemble import KNNScoreEnsemble, create_multi_cleansing_pipeline
-from .utils import load_config, task
+# Add project root to path for imports
+import sys
+from pathlib import Path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from codes.tools import featurebank, grader
+from codes.tools.soup_methods.cknn_score_soup.knn_score_ensemble import KNNScoreEnsemble, create_multi_cleansing_pipeline
+try:
+    from codes.tools.utils import load_config, task
+except ImportError:
+    # Utils might not exist, that's ok
+    pass
 
 # Import for AUROC calculation
 try:
