@@ -39,22 +39,57 @@ class KNNGrader(ABCGrader):
 
         with task('Building KNN index', debug=True):
             try:
+                # Force GPU memory cleanup before creating new resources
+                import gc
+                gc.collect()
+                
+                # Create GPU resources with strict memory limit
                 self.res = faiss.StandardGpuResources()
-                self.index = faiss.IndexFlatL2(tr_x.shape[1])
-                self.index = faiss.index_cpu_to_gpu(self.res, 0, self.index)
+                
+                # Set temp memory limit to prevent excessive allocation
+                temp_memory_mb = 128  # Even stricter: 128MB limit
+                if hasattr(self.res, 'setTempMemory'):
+                    self.res.setTempMemory(temp_memory_mb * 1024 * 1024)
+                
+                # Use float16 configuration to halve memory usage
+                cfg = faiss.GpuIndexFlatConfig()
+                cfg.device = 0
+                cfg.useFloat16 = True  # CRITICAL: Half precision for 50% memory savings
+                
+                self.index = faiss.GpuIndexFlatL2(self.res, tr_x.shape[1], cfg)
                 self.index.add(tr_x.astype(np.float32))
                 self.use_gpu = True
+                
+                logging.info(f"[{key}] Successfully created GPU index with {len(tr_x):,} vectors")
+                
             except RuntimeError as e:
-                if 'cudaMalloc' in str(e):
+                if 'cudaMalloc' in str(e) or 'out of memory' in str(e):
                     logging.warning(
                         "[%s] GPU allocation failed (%s); falling back to CPU Faiss index.",
                         key, e
                     )
+                    # Clean up failed GPU resources
+                    if hasattr(self, 'res') and self.res is not None:
+                        del self.res
                     self.res = None
+                    
+                    # Create CPU index
                     self.index = faiss.IndexFlatL2(tr_x.shape[1])
                     self.index.add(tr_x.astype(np.float32))
+                    self.use_gpu = False
+                    logging.info(f"[{key}] Successfully created CPU index with {len(tr_x):,} vectors")
                 else:
                     raise
+    
+    def __del__(self):
+        """Clean up GPU resources when grader is deleted"""
+        try:
+            if hasattr(self, 'res') and self.res is not None:
+                del self.res
+            if hasattr(self, 'index') and self.index is not None:
+                del self.index
+        except:
+            pass
 
     def grade_flat(self, te_x):  # [M, D]
         Ds, _ = self.index.search(te_x.astype(np.float32), self.K + 1)

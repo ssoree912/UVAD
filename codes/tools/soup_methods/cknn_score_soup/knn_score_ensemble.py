@@ -458,6 +458,22 @@ class KNNScoreEnsemble:
                 self.logger.info(f"  Grader {i}: {meta.get('variation_name', 'unknown')} "
                                 f"weight={w:.4f}, keep_ratio={ratio}, k={meta.get('k', 'N/A')}")
 
+    @staticmethod
+    def fuse_from_scores(per_model_scores_video, weights=None, fusion_method="fisher", logger=None):
+        """
+        Fuse pre-computed scores without re-grading (ephemeral GPU indices)
+        
+        Args:
+            per_model_scores_video: List of [video_scores, ...] from different graders
+            weights: Optional weights for each grader
+            fusion_method: Fusion method ("fisher", "stouffer", "logit")
+            logger: Optional logger
+            
+        Returns:
+            List of fused scores per video
+        """
+        return soup_scores_videowise(per_model_scores_video, weights, fusion_method, logger)
+
 
 # Backward compatibility alias
 KNNScoreSoup = KNNScoreEnsemble

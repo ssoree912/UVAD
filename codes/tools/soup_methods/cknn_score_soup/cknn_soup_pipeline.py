@@ -3,6 +3,10 @@
 CKNN Score Ensemble Pipeline: End-to-end ensemble pipeline for CKNN
 """
 
+# CRITICAL: Set GPU before any imports that might initialize CUDA
+import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 import argparse
 import logging
 import json
@@ -161,8 +165,25 @@ def apply_coreset_sampling(features: np.ndarray, max_samples: int,
         raise ValueError(f"Unknown coreset method: {method}")
 
 
-def check_gpu_memory():
-    """Check available GPU memory"""
+def check_gpu_memory(use_nvml=True):
+    """Check available GPU memory using NVML (accurate) or PyTorch (Faiss-blind)"""
+    if use_nvml:
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            device = 0  # Assume GPU 0
+            handle = pynvml.nvmlDeviceGetHandleByIndex(device)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            used_gb = info.used / 1024**3
+            free_gb = info.free / 1024**3  
+            total_gb = info.total / 1024**3
+            return f"GPU {device} (NVML): {used_gb:.2f}GB used, {free_gb:.2f}GB free / {total_gb:.2f}GB total"
+        except ImportError:
+            pass  # Fall back to PyTorch
+        except Exception as e:
+            return f"NVML error: {e}"
+    
+    # Fallback: PyTorch (only shows PyTorch allocations, misses Faiss)
     if not HAS_TORCH:
         return "N/A (torch not available)"
     
@@ -173,7 +194,7 @@ def check_gpu_memory():
             allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
             cached = torch.cuda.memory_reserved(device) / 1024**3  # GB
             free = total - allocated
-            return f"GPU {device}: {free:.1f}GB free / {total:.1f}GB total (allocated: {allocated:.1f}GB, cached: {cached:.1f}GB)"
+            return f"GPU {device} (PyTorch): {free:.1f}GB free / {total:.1f}GB total (allocated: {allocated:.1f}GB, cached: {cached:.1f}GB)"
         else:
             return "CUDA not available"
     except Exception as e:
@@ -181,10 +202,20 @@ def check_gpu_memory():
 
 
 def cleanup_gpu_memory():
-    """Clean up GPU memory"""
+    """Clean up GPU memory including Faiss resources"""
     if HAS_TORCH and torch.cuda.is_available():
         torch.cuda.empty_cache()
-        gc.collect()
+    
+    # Force garbage collection
+    gc.collect()
+    
+    # Try to clean up any lingering Faiss GPU resources
+    try:
+        import faiss
+        # This forces cleanup of any abandoned GPU resources
+        faiss.get_mem_usage_kb()
+    except:
+        pass
 
 
 def estimate_gpu_memory_needed(n_samples: int, dim: int) -> float:
@@ -322,16 +353,20 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
                     cleanup_gpu_memory()
                     
                     # Create grader (MultiGPU or standard)
+                    grader_key = f'{feature_type}_{appae_var}_th{threshold}_k{k}'
                     if multi_gpu:
                         # TODO: Implement MultiGPUKNNGrader
                         logger.warning("Multi-GPU not implemented yet, using standard grader")
-                        gr = grader.KNNGrader(tr_f_cleansed, K=k, key=f'{feature_type}_{appae_var}')
+                        gr = grader.KNNGrader(tr_f_cleansed, K=k, key=grader_key)
                     else:
-                        gr = grader.KNNGrader(tr_f_cleansed, K=k, key=f'{feature_type}_{appae_var}')
+                        gr = grader.KNNGrader(tr_f_cleansed, K=k, key=grader_key)
                     
                     # Check GPU memory after creating grader
                     memory_info_after = check_gpu_memory()
                     logger.info(f"GPU memory after grader creation: {memory_info_after}")
+                    
+                    # Clean up after each grader creation to prevent accumulation
+                    cleanup_gpu_memory()
                     
                     # Compute quality metrics based on original cleansed size
                     total_train = len(featurebank.get(dataset_name, feature_type, 'train', uvadmode))
@@ -434,9 +469,16 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         # Get original train size for proper weight calculation
         n_total_train = len(featurebank.get(dataset_name, feature_type, 'train', uvadmode))
         
-        # Test individual graders (for comparison)
-        for var in variations:
+        # Test individual graders (EPHEMERAL: compute scores and immediately delete grader)
+        saved_scores = {}  # Store computed scores for soup ensemble
+        for i, var in enumerate(variations):
             try:
+                logger.info(f"Computing scores for variation {i+1}/{len(variations)}: {var['variation_name']}")
+                
+                # Check memory before grading
+                memory_info = check_gpu_memory()
+                logger.info(f"GPU memory before grading: {memory_info}")
+                
                 scores = var['grader'].grade(var['test_features'])
                 
                 # Keep video structure for proper evaluation
@@ -447,6 +489,17 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
                 else:
                     # Fallback: treat as single video
                     video_scores = [scores.flatten() if hasattr(scores, 'flatten') else np.array(scores)]
+                
+                # CRITICAL: Delete grader immediately after scoring to free GPU memory
+                del var['grader']
+                cleanup_gpu_memory()
+                
+                # Check memory after deletion
+                memory_info_after = check_gpu_memory()
+                logger.info(f"GPU memory after grader deletion: {memory_info_after}")
+                
+                # Store scores for ensemble later
+                saved_scores[var['variation_name']] = video_scores
                 
                 # Compute stats
                 scores_flat = np.concatenate([s for s in video_scores if len(s) > 0])
@@ -492,37 +545,39 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
                 logger.error(f"Failed to evaluate variation {var['variation_name']}: {e}")
                 continue
         
-        # Create and run soup ensemble
-        logger.info(f"Creating soup ensemble for {feature_type}")
-        soup = KNNScoreEnsemble(logger=logger)
+        # Create and run soup ensemble FROM PRE-COMPUTED SCORES (no graders!)
+        logger.info(f"Creating soup ensemble for {feature_type} from saved scores")
         
+        # Collect pre-computed scores and compute weights
+        per_model_scores_video = []
         train_features_list = []
-        test_features_list = []
+        weights = []
         
         for var in variations:
+            # Get saved scores
+            if var['variation_name'] in saved_scores:
+                per_model_scores_video.append(saved_scores[var['variation_name']])
+            else:
+                logger.warning(f"No saved scores for {var['variation_name']}, skipping from ensemble")
+                continue
+            
             # Compute quality weight
             if weight_method == "keep_ratio":
                 weight = np.exp(-abs(var['keep_ratio'] - 0.8) / 0.1)
             else:
                 weight = 1.0
-            
-            soup.add_grader(var['grader'], weight=weight, metadata={
-                'variation_name': var['variation_name'],
-                'keep_ratio': var['keep_ratio'],
-                'n_train': var['n_train']
-            })
+            weights.append(weight)
             
             train_features_list.append(var['train_features'])
-            test_features_list.append(var['test_features'])
         
-        # Run soup prediction
+        # Use static method to fuse from pre-computed scores (NO RE-GRADING!)
         try:
-            logger.info(f"Running soup prediction with {len(variations)} graders")
-            soup_scores = soup.predict(
-                test_features_list,
-                use_quality_weights=True,
-                train_features_list=train_features_list,
-                n_total_train=n_total_train
+            logger.info(f"Fusing ensemble from {len(per_model_scores_video)} pre-computed score sets")
+            soup_scores = KNNScoreEnsemble.fuse_from_scores(
+                per_model_scores_video, 
+                weights=np.array(weights), 
+                fusion_method="fisher",
+                logger=logger
             )
             
             # Compute stats from video-wise scores
