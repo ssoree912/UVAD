@@ -34,7 +34,10 @@ class KNNGrader(ABCGrader):
     def __init__(self, tr_x, K=1, key=''):
         super().__init__(key)
         self.K = K
-        self.tr_x = tr_x
+        self.tr_x_dim = tr_x.shape[1]
+        self.key = key
+        # CPU 배열을 연속/float32로 보관 (fallback용)
+        self.tr_x_cpu = np.ascontiguousarray(tr_x.astype(np.float32), dtype=np.float32)
         self.use_gpu = False
 
         with task('Building KNN index', debug=True):
@@ -43,21 +46,21 @@ class KNNGrader(ABCGrader):
                 import gc
                 gc.collect()
                 
-                # Create GPU resources with strict memory limit
+                # Create GPU resources with relaxed memory limit
                 self.res = faiss.StandardGpuResources()
                 
-                # Set temp memory limit to prevent excessive allocation
-                temp_memory_mb = 128  # Even stricter: 128MB limit
+                # Relax temp memory limit (512MB instead of 128MB)
+                temp_memory_mb = 512  # More generous for cuBLAS stability
                 if hasattr(self.res, 'setTempMemory'):
                     self.res.setTempMemory(temp_memory_mb * 1024 * 1024)
                 
-                # Use float32 (float16 causes CUBLAS errors on some matrix sizes)
+                # Use float32 with proper config
                 cfg = faiss.GpuIndexFlatConfig()
                 cfg.device = 0
                 cfg.useFloat16 = False  # Disable float16 due to CUBLAS issues
                 
-                self.index = faiss.GpuIndexFlatL2(self.res, tr_x.shape[1], cfg)
-                self.index.add(tr_x.astype(np.float32))
+                self.index = faiss.GpuIndexFlatL2(self.res, self.tr_x_dim, cfg)
+                self.index.add(self.tr_x_cpu)
                 self.use_gpu = True
                 
                 logging.info(f"[{key}] Successfully created GPU index with {len(tr_x):,} vectors")
@@ -74,8 +77,8 @@ class KNNGrader(ABCGrader):
                     self.res = None
                     
                     # Create CPU index
-                    self.index = faiss.IndexFlatL2(tr_x.shape[1])
-                    self.index.add(tr_x.astype(np.float32))
+                    self.index = faiss.IndexFlatL2(self.tr_x_dim)
+                    self.index.add(self.tr_x_cpu)
                     self.use_gpu = False
                     logging.info(f"[{key}] Successfully created CPU index with {len(tr_x):,} vectors")
                 else:
@@ -92,29 +95,59 @@ class KNNGrader(ABCGrader):
             pass
 
     def grade_flat(self, te_x):  # [M, D]
-        te_x = te_x.astype(np.float32)
-        
-        # Batch search to avoid large GEMM operations that cause CUBLAS errors
-        batch_size = 32  # Small batches to avoid CUBLAS issues
+        te_x = np.ascontiguousarray(te_x, dtype=np.float32)  # 연속/float32 보장
+
+        B = 256  # 배치 크기는 256 권장 (128~512 범위)
+        ALIGN = 32  # 32의 배수로 패딩
         all_distances = []
-        
-        for i in range(0, len(te_x), batch_size):
-            batch = te_x[i:i + batch_size]
+
+        for i in range(0, len(te_x), B):
+            batch = te_x[i:i + B]
+            m = len(batch)
+            
+            # 32의 배수로 패딩 (마지막 배치 포함)
+            pad = (-m) % ALIGN
+            if pad:
+                pad_block = np.repeat(batch[-1:], pad, axis=0)
+                batch_padded = np.vstack([batch, pad_block])
+            else:
+                batch_padded = batch
+
             try:
-                Ds, _ = self.index.search(batch, self.K + 1)
+                # 반드시 연속 메모리로 보장
+                batch_padded = np.ascontiguousarray(batch_padded, dtype=np.float32)
+                Ds, _ = self.index.search(batch_padded, self.K + 1)
+                Ds = Ds[:m]  # 패딩 자르기
                 all_distances.append(Ds)
+                
             except RuntimeError as e:
                 if 'CUBLAS' in str(e) or 'cuBLAS' in str(e):
-                    logging.warning(f"[{self.key}] CUBLAS error on batch {i}, retrying with smaller batch")
-                    # Retry with even smaller batches
-                    for j in range(i, min(i + batch_size, len(te_x))):
-                        single_query = te_x[j:j+1]
-                        Ds_single, _ = self.index.search(single_query, self.K + 1)
-                        all_distances.append(Ds_single)
+                    logging.warning(f"[{self.key}] cuBLAS fail at i={i}, falling back to CPU for this chunk")
+                    
+                    # CPU 인덱스 준비 (1회만)
+                    if not hasattr(self, '_cpu_index'):
+                        self._cpu_index = faiss.IndexFlatL2(self.tr_x_dim)
+                        self._cpu_index.add(self.tr_x_cpu)
+                        logging.info(f"[{self.key}] Created emergency CPU index")
+                    
+                    # 패딩 없이 원본 배치를 CPU로 처리
+                    Ds_cpu, _ = self._cpu_index.search(batch, self.K + 1)
+                    all_distances.append(Ds_cpu)
+                    
+                elif 'cuda' in str(e).lower():
+                    # GPU 완전 실패 시 영구 CPU로 전환
+                    logging.warning(f"[{self.key}] GPU completely failed, switching to CPU permanently")
+                    self.index = faiss.IndexFlatL2(self.tr_x_dim)
+                    self.index.add(self.tr_x_cpu)
+                    self.use_gpu = False
+                    
+                    # 현재 배치부터 CPU로 계속 처리
+                    Ds_cpu, _ = self.index.search(batch, self.K + 1)
+                    all_distances.append(Ds_cpu)
                 else:
                     raise
-        
-        # Concatenate all batch results
+
+        # 모든 배치 결과 연결
         Ds = np.concatenate(all_distances, axis=0)
         
         ret = []
