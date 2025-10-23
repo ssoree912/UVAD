@@ -31,117 +31,75 @@ class ABCGrader:
 
 
 class KNNGrader(ABCGrader):
-    def __init__(self, tr_x, K=1, key=''):
+    def __init__(self, tr_x, K=1, key='', gpu_ids=None, temp_memory_mb: int = 512):
         super().__init__(key)
         self.K = K
-        self.tr_x_dim = tr_x.shape[1]
+        self.dim = tr_x.shape[1]
         self.key = key
-        # CPU 배열을 연속/float32로 보관 (fallback용)
-        self.tr_x_cpu = np.ascontiguousarray(tr_x.astype(np.float32), dtype=np.float32)
+        self.gpu_ids = list(gpu_ids) if gpu_ids else []
         self.use_gpu = False
+        self.multi_gpu = len(self.gpu_ids) > 1
+        self.res = None
+        self.res_list = None
+
+        features = np.ascontiguousarray(tr_x.astype(np.float32))
+        cpu_index = faiss.IndexFlatL2(self.dim)
+        cpu_index.add(features)
 
         with task('Building KNN index', debug=True):
-            try:
-                # Force GPU memory cleanup before creating new resources
-                import gc
-                gc.collect()
-                
-                # Try Multi-GPU sharding first
-                ngpu = faiss.get_num_gpus()
-                if ngpu > 1:
-                    logging.info(f"[{key}] Trying Multi-GPU sharding with {ngpu} GPUs")
-                    try:
-                        # Create resources for all GPUs
-                        self.res = [faiss.StandardGpuResources() for _ in range(ngpu)]
-                        for r in self.res:
-                            r.setTempMemory(512 * 1024 * 1024)
-                        
-                        # Create CPU index first
-                        cpu_index = faiss.IndexFlatL2(self.tr_x_dim)
-                        cpu_index.add(self.tr_x_cpu)
-                        
-                        # Multi-GPU cloning with sharding
-                        co = faiss.GpuMultipleClonerOptions()
-                        co.shard = True         # DB 샤딩 (데이터 분산)
-                        co.useFloat16 = False   # Float32 유지
-                        
-                        # Clone to multiple GPUs
-                        self.index = faiss.index_cpu_to_gpu_multiple(
-                            self.res, list(range(ngpu)), cpu_index, co
-                        )
-                        self.use_gpu = True
-                        
-                        logging.info(f"[{key}] Successfully created Multi-GPU sharded index on {ngpu} GPUs with {len(tr_x):,} vectors")
-                        
-                    except Exception as multi_gpu_error:
-                        logging.warning(f"[{key}] Multi-GPU failed: {multi_gpu_error}, falling back to single GPU")
-                        # Clean up multi-GPU resources
-                        if hasattr(self, 'res'):
-                            del self.res
-                        # Fall through to single GPU
-                        raise RuntimeError("Multi-GPU failed")
-                
-                else:
-                    # Single GPU fallback
-                    logging.info(f"[{key}] Using single GPU (only {ngpu} GPU available)")
-                    raise RuntimeError("Single GPU mode")
-                    
-            except RuntimeError:
-                # Single GPU fallback
+            if self.gpu_ids:
                 try:
-                    self.res = faiss.StandardGpuResources()
-                    
-                    # Relax temp memory limit (512MB)
-                    temp_memory_mb = 512
-                    if hasattr(self.res, 'setTempMemory'):
-                        self.res.setTempMemory(temp_memory_mb * 1024 * 1024)
-                    
-                    # Use float32 with proper config
-                    cfg = faiss.GpuIndexFlatConfig()
-                    cfg.device = 0
-                    cfg.useFloat16 = False
-                    
-                    self.index = faiss.GpuIndexFlatL2(self.res, self.tr_x_dim, cfg)
-                    self.index.add(self.tr_x_cpu)
-                    self.use_gpu = True
-                    
-                    logging.info(f"[{key}] Successfully created single GPU index with {len(tr_x):,} vectors")
-                    
-                except RuntimeError as e:
-                    if 'cudaMalloc' in str(e) or 'out of memory' in str(e) or 'CUBLAS' in str(e):
-                        logging.warning(
-                            "[%s] GPU completely failed (%s); falling back to CPU Faiss index.",
-                            key, e
+                    if self.multi_gpu:
+                        self.res_list = [faiss.StandardGpuResources() for _ in self.gpu_ids]
+                        for r in self.res_list:
+                            if hasattr(r, 'setTempMemory'):
+                                r.setTempMemory(temp_memory_mb * 1024 * 1024)
+                        co = faiss.GpuMultipleClonerOptions()
+                        co.shard = True
+                        co.useFloat16 = False
+                        self.index = faiss.index_cpu_to_gpu_multiple_py(
+                            self.res_list,
+                            [int(g) for g in self.gpu_ids],
+                            cpu_index,
+                            co
                         )
-                        # Clean up failed GPU resources
-                        if hasattr(self, 'res') and self.res is not None:
-                            if isinstance(self.res, list):
-                                for r in self.res:
-                                    del r
-                            else:
-                                del self.res
-                        self.res = None
-                        
-                        # Create CPU index
-                        self.index = faiss.IndexFlatL2(self.tr_x_dim)
-                        self.index.add(self.tr_x_cpu)
-                        self.use_gpu = False
-                        logging.info(f"[{key}] Successfully created CPU index with {len(tr_x):,} vectors")
                     else:
-                        raise
-    
+                        gpu_id = int(self.gpu_ids[0])
+                        self.res = faiss.StandardGpuResources()
+                        if hasattr(self.res, 'setTempMemory'):
+                            self.res.setTempMemory(temp_memory_mb * 1024 * 1024)
+                        self.index = faiss.index_cpu_to_gpu(self.res, gpu_id, cpu_index)
+                    self.use_gpu = True
+                    cpu_index = None
+                    logging.info(
+                        "[%s] Created %sGPU Faiss index on GPUs %s with %s vectors",
+                        key,
+                        "multi-" if self.multi_gpu else "",
+                        self.gpu_ids,
+                        f"{len(tr_x):,}"
+                    )
+                except Exception as e:
+                    logging.warning(
+                        "[%s] GPU setup failed (%s); falling back to CPU index.",
+                        key, e
+                    )
+                    self.res = None
+                    self.res_list = None
+                    self.use_gpu = False
+                    self.multi_gpu = False
+                    self.index = faiss.IndexFlatL2(self.dim)
+                    self.index.add(features)
+            else:
+                self.index = cpu_index
+
     def __del__(self):
-        """Clean up GPU resources when grader is deleted"""
         try:
-            if hasattr(self, 'res') and self.res is not None:
-                if isinstance(self.res, list):
-                    for r in self.res:
-                        del r
-                else:
-                    del self.res
-            if hasattr(self, 'index') and self.index is not None:
-                del self.index
-        except:
+            if isinstance(self.res_list, list):
+                for r in self.res_list:
+                    del r
+            if self.res is not None:
+                del self.res
+        except Exception:
             pass
 
     def grade_flat(self, te_x):  # [M, D]

@@ -3,16 +3,16 @@
 CKNN Score Ensemble Pipeline: End-to-end ensemble pipeline for CKNN
 """
 
-# CRITICAL: Set GPU before any imports that might initialize CUDA
-import os
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
+
+import os  # Do NOT force CUDA_VISIBLE_DEVICES here; honor external env or --gpu later in main()
 import argparse
 import logging
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
+import faiss
 
 # Add project root to path for imports
 import sys
@@ -298,7 +298,7 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
                            feature_type: str = 'app',
                            max_train_samples: int = 500000,
                            coreset_method: str = "random",
-                           multi_gpu: bool = False,
+                           gpu_ids: Optional[List[int]] = None,
                            logger: Optional[logging.Logger] = None) -> List[Dict]:
     """
     Create multiple KNN grader variations
@@ -312,7 +312,7 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
         feature_type: Feature type ('app' or 'mot')
         max_train_samples: Maximum training samples per grader
         coreset_method: Method for coreset sampling
-        multi_gpu: Use multi-GPU grader
+        gpu_ids: GPUs to use for KNN (None for CPU)
         logger: Optional logger
         
     Returns:
@@ -352,14 +352,14 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
                     # Clean up GPU memory before creating grader
                     cleanup_gpu_memory()
                     
-                    # Create grader (MultiGPU or standard)
+                    # Create grader
                     grader_key = f'{feature_type}_{appae_var}_th{threshold}_k{k}'
-                    if multi_gpu:
-                        # TODO: Implement MultiGPUKNNGrader
-                        logger.warning("Multi-GPU not implemented yet, using standard grader")
-                        gr = grader.KNNGrader(tr_f_cleansed, K=k, key=grader_key)
-                    else:
-                        gr = grader.KNNGrader(tr_f_cleansed, K=k, key=grader_key)
+                    gr = grader.KNNGrader(
+                        tr_f_cleansed,
+                        K=k,
+                        key=grader_key,
+                        gpu_ids=gpu_ids
+                    )
                     
                     # Check GPU memory after creating grader
                     memory_info_after = check_gpu_memory()
@@ -406,7 +406,7 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
                             output_dir: Optional[Path] = None,
                             max_train_samples: int = 500000,
                             coreset_method: str = "random",
-                            multi_gpu: bool = False,
+                            gpu_ids: Optional[List[int]] = None,
                             logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """
     Run complete CKNN score ensemble evaluation
@@ -420,6 +420,7 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         feature_types: Types of features to use
         weight_method: Method for computing quality weights
         output_dir: Output directory for results
+        gpu_ids: List of GPU IDs to use (None for CPU)
         logger: Optional logger
         
     Returns:
@@ -447,6 +448,7 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         'k_values': k_values,
         'feature_types': feature_types,
         'weight_method': weight_method,
+        'gpu_ids': gpu_ids,
         'grader_results': [],
         'soup_results': {},
         'roc_results': []  # For JSON format compatible with your example
@@ -459,7 +461,7 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         variations = create_grader_variations(
             dataset_name, uvadmode, appae_variations, cleanse_thresholds,
             k_values, feature_type, max_train_samples, coreset_method,
-            multi_gpu, logger
+            gpu_ids, logger
         )
         
         if not variations:
@@ -656,37 +658,50 @@ def main():
                        help="Output directory for results")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--gpu", type=int, default=None, 
-                       help="GPU device ID (e.g., 0, 1, 2). If not specified, uses CPU or auto-detects GPU.")
+                       help="Single GPU device ID (deprecated when using --gpu_list).")
+    parser.add_argument("--gpu_list", nargs="+", type=int, default=None,
+                       help="Explicit list of GPU IDs for multi-GPU KNN (e.g., 0 1 2).")
     parser.add_argument("--max_train_samples", type=int, default=50000,
                        help="Max training samples per KNN grader (reduces GPU memory usage)")
     parser.add_argument("--coreset_method", choices=["random", "kmeans", "farthest"], default="random",
                        help="Method for selecting coreset when reducing training samples")
     parser.add_argument("--multi_gpu", action="store_true",
-                       help="Use multiple GPUs for KNN graders (experimental)")
+                       help="Use all available GPUs for KNN graders if --gpu_list is not provided.")
     
     args = parser.parse_args()
-    
-    # Set GPU device globally
-    if args.gpu is not None:
-        import os
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-        logger_temp = logging.getLogger("gpu_setup")
-        logger_temp.info(f"Set CUDA_VISIBLE_DEVICES={args.gpu} (Single GPU mode)")
+
+    # Determine GPU usage
+    gpu_ids: Optional[List[int]] = None
+    if args.gpu_list:
+        gpu_ids = [int(g) for g in args.gpu_list]
+    elif args.gpu is not None:
+        gpu_ids = [int(args.gpu)]
+    elif args.multi_gpu:
+        try:
+            gpu_count = faiss.get_num_gpus()
+            if gpu_count > 0:
+                gpu_ids = list(range(gpu_count))
+        except Exception:
+            gpu_ids = None
     else:
-        logger_temp = logging.getLogger("gpu_setup")
-        logger_temp.info("No --gpu specified, using all available GPUs (Multi-GPU mode)")
-    
+        try:
+            gpu_count = faiss.get_num_gpus()
+            if gpu_count > 0:
+                gpu_ids = [0]
+        except Exception:
+            gpu_ids = None
+
     logger = setup_logger(args.verbose)
-    
+
     logger.info("Starting CKNN Score Ensemble Pipeline")
     logger.info(f"Dataset: {args.dataset_name}, Mode: {args.uvadmode}")
     logger.info(f"AppAE variations: {args.appae_variations}")
     logger.info(f"Cleanse thresholds: {args.cleanse_thresholds}")
     logger.info(f"k values: {args.k_values}")
-    if args.gpu is not None:
-        logger.info(f"Using GPU: {args.gpu}")
+    if gpu_ids:
+        logger.info(f"Using GPUs: {gpu_ids}")
     else:
-        logger.info("Using CPU or auto-detected GPU")
+        logger.info("No GPUs specified or detected; falling back to CPU indices.")
     
     try:
         results = run_cknn_soup_evaluation(
@@ -700,7 +715,7 @@ def main():
             output_dir=Path(args.output_dir) if args.output_dir else None,
             max_train_samples=args.max_train_samples,
             coreset_method=args.coreset_method,
-            multi_gpu=args.multi_gpu,
+            gpu_ids=gpu_ids,
             logger=logger
         )
         
