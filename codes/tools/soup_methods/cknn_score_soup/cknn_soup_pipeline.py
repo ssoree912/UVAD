@@ -227,27 +227,287 @@ def estimate_gpu_memory_needed(n_samples: int, dim: int) -> float:
     return estimated_total_gb
 
 
-def load_test_labels(dataset_name: str, uvadmode: str) -> np.ndarray:
-    """Load test labels for AUROC calculation"""
-    try:
-        # Try to load labels from standard locations
-        label_paths = [
-            f'features/{dataset_name}/labels/{uvadmode}_test_labels.npy',
-            f'features/{dataset_name}/labels/test_labels.npy',
-            f'features/{dataset_name}/test_labels.npy'
-        ]
-        
-        for label_path in label_paths:
-            if Path(label_path).exists():
-                labels = np.load(label_path, allow_pickle=True)
-                return labels
-        
-        # If no labels found, return None
+def load_test_labels(dataset_name: str, uvadmode: str):
+    """
+    Return per-video label arrays based on meta/frame_labels_*.npy and test_lengths_*.npy.
+    """
+    logger = logging.getLogger(__name__)
+
+    # 먼저 기존 경로에서 찾기
+    label_paths = [
+        f'features/{dataset_name}/labels/{uvadmode}_test_labels.npy',
+        f'features/{dataset_name}/labels/test_labels.npy',
+        f'features/{dataset_name}/test_labels.npy'
+    ]
+    for label_path in label_paths:
+        path = Path(label_path)
+        if path.exists():
+            logger.info(f"Loaded test labels from {path}")
+            return np.load(path, allow_pickle=True)
+
+    # features/ 에 없으면 meta/에서 읽기
+    meta_dir = Path("meta")
+    labels_path = meta_dir / f"frame_labels_{dataset_name}.npy"
+    lengths_path = meta_dir / f"test_lengths_{dataset_name}.npy"
+
+    if not labels_path.exists() or not lengths_path.exists():
+        logger.warning(f"meta files not found: {labels_path}, {lengths_path}")
         return None
+
+    frame_labels = np.load(labels_path, allow_pickle=True)
+    test_lengths = np.load(lengths_path, allow_pickle=True)
+
+    # 각 비디오별로 라벨을 잘라서 리스트로 만들어 반환
+    splits = np.cumsum(test_lengths)
+    splits = np.insert(splits, 0, 0)
+    video_labels = [frame_labels[splits[i]:splits[i+1]] for i in range(len(test_lengths))]
+    logger.info(f"Loaded test labels from meta/ for {dataset_name} ({len(video_labels)} videos)")
+    return video_labels
+
+
+def load_test_frame_lengths(dataset_name: str) -> Optional[np.ndarray]:
+    """Load test video frame lengths for bbox->frame conversion"""
+    try:
+        meta_dir = Path("meta")
+        lengths_path = meta_dir / f"test_lengths_{dataset_name}.npy"
+        
+        if not lengths_path.exists():
+            logging.getLogger(__name__).warning(f"Test lengths not found: {lengths_path}")
+            return None
+            
+        test_lengths = np.load(lengths_path, allow_pickle=True)
+        logging.getLogger(__name__).info(f"Loaded test frame lengths for {dataset_name}")
+        return test_lengths
         
     except Exception as e:
-        logging.getLogger(__name__).warning(f"Could not load test labels: {e}")
+        logging.getLogger(__name__).warning(f"Could not load test frame lengths: {e}")
         return None
+
+
+def bbox_scores_to_frame_scores(raw_scores: Any,
+                               test_lengths: np.ndarray,
+                               logger: Optional[logging.Logger] = None) -> List[np.ndarray]:
+    """
+    Convert bbox-level scores to frame-level scores using max aggregation.
+    Handles both flattened per-frame arrays and already grouped per-video arrays.
+    
+    Args:
+        raw_scores: Output of KNN grader (object array or list)
+        test_lengths: Number of frames per test video
+        logger: Optional logger
+        
+    Returns:
+        List of frame-level scores per video
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
+    # Normalize input to list
+    if isinstance(raw_scores, np.ndarray):
+        scores_list = raw_scores.tolist()
+    elif isinstance(raw_scores, list):
+        scores_list = raw_scores
+    else:
+        logger.warning(f"Unsupported score data type: {type(raw_scores)}")
+        return []
+
+    total_frames = sum(int(n) for n in test_lengths)
+    frame_scores: List[np.ndarray] = []
+
+    # Case 1: scores already grouped per video (len == #videos)
+    if len(scores_list) == len(test_lengths):
+        for video_idx, (bbox_per_frame, n_frames) in enumerate(zip(scores_list, test_lengths)):
+            # bbox_per_frame can itself be an array/list of per-frame arrays or already frame scores
+            if isinstance(bbox_per_frame, np.ndarray) and bbox_per_frame.dtype == object:
+                per_frame = bbox_per_frame.tolist()
+            else:
+                per_frame = bbox_per_frame
+
+            frames = []
+            for item in per_frame:
+                if isinstance(item, (list, tuple, np.ndarray)):
+                    arr = np.asarray(item, dtype=np.float32)
+                    frames.append(float(arr.max()) if arr.size else 0.0)
+                else:
+                    frames.append(float(item))
+            # Ensure length matches n_frames
+            if len(frames) != n_frames:
+                frames = (frames + [0.0] * n_frames)[:n_frames]
+            frame_scores.append(np.asarray(frames, dtype=np.float32))
+
+        logger.info(f"Converted {len(frame_scores)} videos from (video-wise) bbox scores to frame scores")
+        return frame_scores
+
+    # Case 2: flattened per-frame list (len == total frames)
+    if len(scores_list) == total_frames:
+        idx = 0
+        for video_idx, n_frames in enumerate(test_lengths):
+            frames = np.zeros(int(n_frames), dtype=np.float32)
+            for frame in range(int(n_frames)):
+                if idx >= len(scores_list):
+                    break
+                bbox_scores = scores_list[idx]
+                if isinstance(bbox_scores, (list, tuple, np.ndarray)):
+                    arr = np.asarray(bbox_scores, dtype=np.float32)
+                    frames[frame] = float(arr.max()) if arr.size else 0.0
+                else:
+                    frames[frame] = float(bbox_scores)
+                idx += 1
+            frame_scores.append(frames)
+
+        logger.info(f"Converted flattened bbox scores ({total_frames} frames) to {len(frame_scores)} videos")
+        return frame_scores
+
+    logger.warning(f"Score structure not understood (len={len(scores_list)}); returning raw scores")
+    return [np.asarray(s, dtype=np.float32) for s in scores_list]
+
+
+def apply_temporal_smoothing(frame_scores: List[np.ndarray], 
+                           sigma: float = 3.0,
+                           logger: Optional[logging.Logger] = None) -> List[np.ndarray]:
+    """
+    Apply Gaussian temporal smoothing to frame scores
+    
+    Args:
+        frame_scores: List of frame-level scores per video
+        sigma: Gaussian kernel sigma for smoothing
+        logger: Optional logger
+        
+    Returns:
+        List of smoothed frame scores per video
+    """
+    try:
+        from scipy.ndimage import gaussian_filter1d
+    except ImportError:
+        if logger:
+            logger.warning("scipy not available, skipping temporal smoothing")
+        return frame_scores
+    
+    if logger is None:
+        logger = logging.getLogger(__name__)
+        
+    smoothed_scores = []
+    
+    for video_idx, scores in enumerate(frame_scores):
+        if len(scores) <= 1:
+            # Can't smooth single frame or empty
+            smoothed_scores.append(scores)
+            continue
+            
+        # Apply Gaussian smoothing
+        smoothed = gaussian_filter1d(scores.astype(np.float64), sigma=sigma)
+        smoothed_scores.append(smoothed.astype(np.float32))
+        
+        if logger and video_idx < 3:  # Log first few videos
+            orig_range = f"[{scores.min():.3f}, {scores.max():.3f}]"
+            smooth_range = f"[{smoothed.min():.3f}, {smoothed.max():.3f}]"
+            logger.debug(f"Video {video_idx}: smoothed {orig_range} → {smooth_range}")
+    
+    logger.info(f"Applied temporal smoothing (sigma={sigma}) to {len(frame_scores)} videos")
+    return smoothed_scores
+
+
+def normalize_scores(scores: List[np.ndarray], 
+                    method: str = "minmax",
+                    logger: Optional[logging.Logger] = None) -> List[np.ndarray]:
+    """
+    Normalize scores across all videos for proper fusion
+    
+    Args:
+        scores: List of score arrays per video
+        method: Normalization method ("minmax", "zscore")
+        logger: Optional logger
+        
+    Returns:
+        List of normalized score arrays per video
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+        
+    # Flatten all scores to compute global statistics
+    all_scores = np.concatenate([s for s in scores if len(s) > 0])
+    
+    if len(all_scores) == 0:
+        logger.warning("No scores to normalize")
+        return scores
+    
+    if method == "minmax":
+        min_score = all_scores.min()
+        max_score = all_scores.max()
+        if max_score == min_score:
+            logger.warning("All scores are identical, skipping normalization")
+            return scores
+        normalized = [(s - min_score) / (max_score - min_score) for s in scores]
+        logger.info(f"Applied min-max normalization: [{min_score:.3f}, {max_score:.3f}] → [0, 1]")
+        
+    elif method == "zscore":
+        mean_score = all_scores.mean()
+        std_score = all_scores.std()
+        if std_score == 0:
+            logger.warning("Zero standard deviation, skipping normalization")
+            return scores
+        normalized = [(s - mean_score) / std_score for s in scores]
+        logger.info(f"Applied z-score normalization: μ={mean_score:.3f}, σ={std_score:.3f}")
+        
+    else:
+        logger.warning(f"Unknown normalization method: {method}")
+        return scores
+    
+    return normalized
+
+
+def combine_feature_signals(app_scores: List[np.ndarray],
+                           mot_scores: List[np.ndarray], 
+                           method: str = "average",
+                           app_weight: float = 0.5,
+                           logger: Optional[logging.Logger] = None) -> List[np.ndarray]:
+    """
+    Combine App and Mot feature signals following CKNN paper methodology
+    
+    Args:
+        app_scores: Appearance feature scores per video
+        mot_scores: Motion feature scores per video  
+        method: Combination method ("average", "weighted")
+        app_weight: Weight for app signal (mot_weight = 1 - app_weight)
+        logger: Optional logger
+        
+    Returns:
+        List of combined scores per video
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    if len(app_scores) != len(mot_scores):
+        logger.error(f"Signal count mismatch: {len(app_scores)} app vs {len(mot_scores)} mot")
+        return app_scores  # Return app as fallback
+    
+    # Normalize both signals before combination (as per CKNN paper)
+    app_norm = normalize_scores(app_scores, method="minmax", logger=logger)
+    mot_norm = normalize_scores(mot_scores, method="minmax", logger=logger)
+    
+    combined_scores = []
+    mot_weight = 1.0 - app_weight
+    
+    for video_idx, (app_vid, mot_vid) in enumerate(zip(app_norm, mot_norm)):
+        if len(app_vid) != len(mot_vid):
+            logger.warning(f"Video {video_idx} frame mismatch: {len(app_vid)} app vs {len(mot_vid)} mot")
+            # Use shorter length
+            min_len = min(len(app_vid), len(mot_vid))
+            app_vid = app_vid[:min_len]
+            mot_vid = mot_vid[:min_len]
+        
+        if method == "average":
+            combined = (app_vid + mot_vid) / 2.0
+        elif method == "weighted":
+            combined = app_weight * app_vid + mot_weight * mot_vid
+        else:
+            logger.warning(f"Unknown combination method: {method}, using average")
+            combined = (app_vid + mot_vid) / 2.0
+            
+        combined_scores.append(combined.astype(np.float32))
+    
+    logger.info(f"Combined {len(app_scores)} videos with method={method}, app_weight={app_weight:.2f}")
+    return combined_scores
 
 
 def compute_auroc(scores, labels) -> Optional[float]:
@@ -313,11 +573,6 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
         max_train_samples: Maximum training samples per grader
         coreset_method: Method for coreset sampling
         gpu_ids: GPUs to use for KNN (None for CPU)
-        faiss_temp_mb: Faiss temporary memory buffer size in MB
-        use_ivf: Whether to use IVF-Flat index for memory efficiency
-        ivf_nlist: Number of clusters for IVF index
-        ivf_nprobe: Number of clusters to search in IVF index
-        use_float16: Whether to use float16 precision
         logger: Optional logger
         
     Returns:
@@ -328,12 +583,22 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
     
     variations = []
     
-    for appae_var in appae_variations:
+    # For MOT, we don't need multiple AppAE variations since fGMM is used
+    variations_to_process = appae_variations if feature_type == 'app' else ['fgmm']
+    
+    for appae_var in variations_to_process:
         for threshold in cleanse_thresholds:
             for k in k_values:
                 try:
-                    # Load cleansed features
-                    cleanse_scorename = f"aerecon_{appae_var}"
+                    # Load cleansed features with appropriate score name
+                    if feature_type == 'app':
+                        cleanse_scorename = f"aerecon_{appae_var}"
+                    elif feature_type == 'mot':
+                        # For MOT, use fGMM cleanse scores
+                        cleanse_scorename = "velo_fgmm"  # Standard fGMM score file
+                    else:
+                        raise ValueError(f"Unknown feature type: {feature_type}")
+                        
                     tr_f_cleansed, te_f = load_cleansed_features(
                         dataset_name, uvadmode, cleanse_scorename, threshold, feature_type
                     )
@@ -358,7 +623,16 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
                     cleanup_gpu_memory()
                     
                     # Create grader
-                    grader_key = f'{feature_type}_{appae_var}_th{threshold}_k{k}'
+                    if feature_type == 'app':
+                        grader_key = f'{feature_type}_{appae_var}_th{threshold}_k{k}'
+                        variation_name = f"{appae_var}_thresh{threshold}_k{k}_{feature_type}"
+                    elif feature_type == 'mot':
+                        grader_key = f'{feature_type}_fgmm_th{threshold}_k{k}'
+                        variation_name = f"fgmm_thresh{threshold}_k{k}_{feature_type}"
+                    else:
+                        grader_key = f'{feature_type}_th{threshold}_k{k}'
+                        variation_name = f"thresh{threshold}_k{k}_{feature_type}"
+                        
                     gr = grader.KNNGrader(
                         tr_f_cleansed,
                         K=k,
@@ -379,15 +653,14 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
                     
                     variation = {
                         'grader': gr,
-                        'appae_var': appae_var,
+                        'appae_var': appae_var if feature_type == 'app' else 'fgmm',
                         'threshold': threshold,
                         'k': k,
                         'feature_type': feature_type,
-                        'train_features': tr_f_cleansed,
                         'test_features': te_f,
                         'keep_ratio': keep_ratio,
                         'n_train': len(tr_f_cleansed),
-                        'variation_name': f"{appae_var}_thresh{threshold}_k{k}"
+                        'variation_name': variation_name
                     }
                     
                     variations.append(variation)
@@ -426,11 +699,6 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         weight_method: Method for computing quality weights
         output_dir: Output directory for results
         gpu_ids: List of GPU IDs to use (None for CPU)
-        faiss_temp_mb: Faiss temporary memory buffer size in MB
-        use_ivf: Whether to use IVF-Flat index for memory efficiency
-        ivf_nlist: Number of clusters for IVF index
-        ivf_nprobe: Number of clusters to search in IVF index
-        use_float16: Whether to use float16 precision
         logger: Optional logger
         
     Returns:
@@ -443,12 +711,19 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load test labels once for AUROC calculation
+    # Load test labels and frame lengths once for AUROC calculation
     test_labels = load_test_labels(dataset_name, uvadmode)
+    test_lengths = load_test_frame_lengths(dataset_name)
+    
     if test_labels is not None:
         logger.info(f"Loaded test labels for AUROC evaluation")
     else:
         logger.warning("No test labels found - AUROC evaluation disabled")
+        
+    if test_lengths is not None:
+        logger.info(f"Loaded test frame lengths for bbox->frame conversion")
+    else:
+        logger.warning("No test frame lengths found - using bbox scores directly")
     
     results = {
         'dataset_name': dataset_name,
@@ -463,6 +738,9 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         'soup_results': {},
         'roc_results': []  # For JSON format compatible with your example
     }
+    
+    # Store feature-specific results for combination
+    feature_soup_scores = {}  # feature_type -> smoothed frame scores
     
     for feature_type in feature_types:
         logger.info(f"Processing feature type: {feature_type}")
@@ -481,8 +759,8 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         # Get original train size for proper weight calculation
         n_total_train = len(featurebank.get(dataset_name, feature_type, 'train', uvadmode))
         
-        # Test individual graders (EPHEMERAL: compute scores and immediately delete grader)
-        saved_scores = {}  # Store computed scores for soup ensemble
+        # Test individual graders (ephemeral grading, immediately free GPU memory)
+        saved_scores: Dict[str, List[np.ndarray]] = {}
         for i, var in enumerate(variations):
             try:
                 logger.info(f"Computing scores for variation {i+1}/{len(variations)}: {var['variation_name']}")
@@ -492,44 +770,50 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
                 logger.info(f"GPU memory before grading: {memory_info}")
                 
                 scores = var['grader'].grade(var['test_features'])
-                
-                # Keep video structure for proper evaluation
-                if isinstance(scores, np.ndarray) and scores.dtype == object:
-                    video_scores = list(scores)
-                elif isinstance(scores, list):
-                    video_scores = scores
+
+                # Convert to frame-level scores using test lengths (if available)
+                if test_lengths is not None:
+                    frame_scores = bbox_scores_to_frame_scores(scores, test_lengths, logger)
                 else:
-                    # Fallback: treat as single video
-                    video_scores = [scores.flatten() if hasattr(scores, 'flatten') else np.array(scores)]
-                
-                # CRITICAL: Delete grader immediately after scoring to free GPU memory
+                    # Fallback: treat each element as already frame-level
+                    if isinstance(scores, np.ndarray) and scores.dtype == object:
+                        frame_scores = [np.asarray(s, dtype=np.float32) for s in scores]
+                    elif isinstance(scores, list):
+                        frame_scores = [np.asarray(s, dtype=np.float32) for s in scores]
+                    else:
+                        frame_scores = [np.asarray(scores, dtype=np.float32)]
+                saved_scores[var['variation_name']] = frame_scores
+
+                # Free heavy objects promptly
                 del var['grader']
+                var.pop('test_features', None)
                 cleanup_gpu_memory()
+
+                if any(len(s) > 0 for s in frame_scores):
+                    scores_flat = np.concatenate([s for s in frame_scores if len(s) > 0]).astype(np.float32)
+                else:
+                    scores_flat = np.empty(0, dtype=np.float32)
+
+                # Temporal smoothing + AUROC (if labels available)
+                if test_lengths is not None and test_labels is not None:
+                    smooth_scores = apply_temporal_smoothing(frame_scores, sigma=3.0, logger=logger)
+                    auroc = compute_auroc(smooth_scores, test_labels)
+                else:
+                    auroc = None
                 
-                # Check memory after deletion
-                memory_info_after = check_gpu_memory()
-                logger.info(f"GPU memory after grader deletion: {memory_info_after}")
-                
-                # Store scores for ensemble later
-                saved_scores[var['variation_name']] = video_scores
-                
-                # Compute stats
-                scores_flat = np.concatenate([s for s in video_scores if len(s) > 0])
-                
-                # Compute AUROC if labels available
-                auroc = compute_auroc(video_scores, test_labels)
-                
+                stats = {
+                    'mean': float(scores_flat.mean()) if scores_flat.size else 0.0,
+                    'std': float(scores_flat.std()) if scores_flat.size else 0.0,
+                    'min': float(scores_flat.min()) if scores_flat.size else 0.0,
+                    'max': float(scores_flat.max()) if scores_flat.size else 0.0,
+                    'n_scores': int(scores_flat.size),
+                    'n_videos': len(frame_scores)
+                }
+
                 var_result = {
                     'variation_name': var['variation_name'],
                     'feature_type': feature_type,
-                    'scores_stats': {
-                        'mean': float(scores_flat.mean()),
-                        'std': float(scores_flat.std()),
-                        'min': float(scores_flat.min()),
-                        'max': float(scores_flat.max()),
-                        'n_scores': len(scores_flat),
-                        'n_videos': len(video_scores)
-                    },
+                    'scores_stats': stats,
                     'keep_ratio': var['keep_ratio'],
                     'n_train': var['n_train'],
                     'auroc': auroc
@@ -540,17 +824,18 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
                 # Add to ROC results in your requested format
                 roc_entry = {
                     "label": var['variation_name'],
-                    "checkpoint": f"grader_variation_{var['variation_name']}",  # Placeholder
-                    "score_path": f"computed_scores_{var['variation_name']}",  # Placeholder
+                    "checkpoint": f"grader_variation_{var['variation_name']}",
+                    "score_path": f"scores_{var['variation_name']}.npy" if output_dir else "",
                     "auroc": auroc,
-                    "raw_output": f"AUROC {dataset_name} ({uvadmode}): {auroc:.6f}" if auroc else "AUROC computation failed"
+                    "raw_output": f"AUROC {dataset_name} ({uvadmode}): {auroc:.6f}"
+                                 if auroc is not None else "AUROC computation failed"
                 }
                 results['roc_results'].append(roc_entry)
                 
                 # Save individual scores (video-wise format for evaluation)
                 if output_dir:
                     score_file = output_dir / f"scores_{var['variation_name']}.npy"
-                    np.save(score_file, np.array(video_scores, dtype=object), allow_pickle=True)
+                    np.save(score_file, np.array(frame_scores, dtype=object), allow_pickle=True)
                     logger.debug(f"Saved individual scores to {score_file}")
                     
             except Exception as e:
@@ -561,9 +846,8 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         logger.info(f"Creating soup ensemble for {feature_type} from saved scores")
         
         # Collect pre-computed scores and compute weights
-        per_model_scores_video = []
-        train_features_list = []
-        weights = []
+        per_model_scores_video: List[List[np.ndarray]] = []
+        weights: List[float] = []
         
         for var in variations:
             # Get saved scores
@@ -579,34 +863,53 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
             else:
                 weight = 1.0
             weights.append(weight)
-            
-            train_features_list.append(var['train_features'])
         
+        if not per_model_scores_video:
+            logger.warning(f"No valid scores collected for feature {feature_type}; skipping ensemble")
+            continue
+
         # Use static method to fuse from pre-computed scores (NO RE-GRADING!)
         try:
             logger.info(f"Fusing ensemble from {len(per_model_scores_video)} pre-computed score sets")
+            weights_array = np.array(weights, dtype=np.float32) if weights else None
             soup_scores = KNNScoreEnsemble.fuse_from_scores(
-                per_model_scores_video, 
-                weights=np.array(weights), 
+                per_model_scores_video,
+                weights=weights_array,
                 fusion_method="fisher",
                 logger=logger
             )
             
             # Compute stats from video-wise scores
-            soup_scores_flat = np.concatenate([s for s in soup_scores if len(s) > 0])
+            if any(len(s) > 0 for s in soup_scores):
+                soup_scores_flat = np.concatenate([s for s in soup_scores if len(s) > 0]).astype(np.float32)
+            else:
+                soup_scores_flat = np.empty(0, dtype=np.float32)
             
-            # Compute AUROC for ensemble
-            soup_auroc = compute_auroc(soup_scores, test_labels)
+            # Convert ensemble scores to frame-level and apply temporal smoothing for AUROC
+            if test_lengths is not None and test_labels is not None:
+                # Convert bbox scores to frame scores
+                soup_frame_scores = bbox_scores_to_frame_scores(soup_scores, test_lengths, logger)
+                # Apply temporal smoothing
+                soup_smooth_scores = apply_temporal_smoothing(soup_frame_scores, sigma=3.0, logger=logger)
+                # Store smoothed frame scores for potential combination
+                feature_soup_scores[feature_type] = soup_smooth_scores
+                # Compute AUROC with frame-level scores
+                soup_auroc = compute_auroc(soup_smooth_scores, test_labels)
+            else:
+                # Fallback to direct computation (may have length mismatch)
+                soup_auroc = compute_auroc(soup_scores, test_labels)
+                # Store raw scores if no frame conversion available
+                feature_soup_scores[feature_type] = soup_scores
             
             soup_result = {
                 'feature_type': feature_type,
                 'n_graders': len(variations),
                 'scores_stats': {
-                    'mean': float(soup_scores_flat.mean()),
-                    'std': float(soup_scores_flat.std()),
-                    'min': float(soup_scores_flat.min()),
-                    'max': float(soup_scores_flat.max()),
-                    'n_scores': len(soup_scores_flat),
+                    'mean': float(soup_scores_flat.mean()) if soup_scores_flat.size else 0.0,
+                    'std': float(soup_scores_flat.std()) if soup_scores_flat.size else 0.0,
+                    'min': float(soup_scores_flat.min()) if soup_scores_flat.size else 0.0,
+                    'max': float(soup_scores_flat.max()) if soup_scores_flat.size else 0.0,
+                    'n_scores': int(soup_scores_flat.size),
                     'n_videos': len(soup_scores)
                 },
                 'weight_method': weight_method,
@@ -621,7 +924,8 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
                 "checkpoint": f"ensemble_model_{feature_type}",
                 "score_path": f"ensemble_scores_{feature_type}.npy",
                 "auroc": soup_auroc,
-                "raw_output": f"AUROC {dataset_name} ({uvadmode}): {soup_auroc:.6f}" if soup_auroc else "AUROC computation failed"
+                "raw_output": f"AUROC {dataset_name} ({uvadmode}): {soup_auroc:.6f}"
+                               if soup_auroc is not None else "AUROC computation failed"
             }
             results['roc_results'].append(ensemble_roc_entry)
             
@@ -630,13 +934,89 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
                 soup_score_file = output_dir / f"soup_scores_{feature_type}.npy"
                 np.save(soup_score_file, np.array(soup_scores, dtype=object), allow_pickle=True)
                 logger.info(f"Saved soup scores to {soup_score_file}")
-                
-                # Save metadata
-                soup.save_metadata(output_dir / f"soup_metadata_{feature_type}.json")
+
+                metadata = {
+                    "feature_type": feature_type,
+                    "num_graders": len(per_model_scores_video),
+                    "weight_method": weight_method,
+                    "weights": weights_array.tolist() if weights_array is not None else [],
+                    "variation_names": [var['variation_name'] for var in variations if var['variation_name'] in saved_scores]
+                }
+                with open(output_dir / f"soup_metadata_{feature_type}.json", 'w') as f:
+                    json.dump(metadata, f, indent=2)
                 
         except Exception as e:
             logger.error(f"Failed to run soup for {feature_type}: {e}")
             continue
+    
+    # Combine App+Mot signals if both are available (CKNN paper methodology)
+    if len(feature_soup_scores) >= 2 and 'app' in feature_soup_scores and 'mot' in feature_soup_scores:
+        logger.info("Combining App and Mot signals following CKNN paper methodology")
+        
+        try:
+            # Combine normalized App and Mot signals
+            combined_scores = combine_feature_signals(
+                feature_soup_scores['app'],
+                feature_soup_scores['mot'],
+                method="average",  # CKNN paper uses average
+                logger=logger
+            )
+            
+            # Compute AUROC for combined signal
+            if test_labels is not None:
+                combined_auroc = compute_auroc(combined_scores, test_labels)
+            else:
+                combined_auroc = None
+            
+            combined_flat = np.concatenate([s for s in combined_scores if len(s) > 0]).astype(np.float32) \
+                if any(len(s) > 0 for s in combined_scores) else np.empty(0, dtype=np.float32)
+            
+            # Add combined result
+            combined_result = {
+                'feature_type': 'app_mot_combined',
+                'n_graders': results['soup_results'].get('app', {}).get('n_graders', 0) + 
+                           results['soup_results'].get('mot', {}).get('n_graders', 0),
+                'scores_stats': {
+                    'mean': float(combined_flat.mean()) if combined_flat.size else 0.0,
+                    'std': float(combined_flat.std()) if combined_flat.size else 0.0,
+                    'min': float(combined_flat.min()) if combined_flat.size else 0.0,
+                    'max': float(combined_flat.max()) if combined_flat.size else 0.0,
+                    'n_scores': int(combined_flat.size),
+                    'n_videos': len(combined_scores)
+                },
+                'weight_method': weight_method,
+                'auroc': combined_auroc,
+                'combination_method': 'average'
+            }
+            
+            results['soup_results']['app_mot_combined'] = combined_result
+            
+            # Add to ROC results
+            combined_roc_entry = {
+                "label": f"ensemble_app_mot_combined_{weight_method}",
+                "checkpoint": "ensemble_model_app_mot_combined",
+                "score_path": "ensemble_scores_app_mot_combined.npy",
+                "auroc": combined_auroc,
+                "raw_output": f"AUROC {dataset_name} ({uvadmode}): {combined_auroc:.6f}" if combined_auroc else "AUROC computation failed"
+            }
+            results['roc_results'].append(combined_roc_entry)
+            
+            # Save combined scores
+            if output_dir:
+                combined_score_file = output_dir / "soup_scores_app_mot_combined.npy"
+                np.save(combined_score_file, np.array(combined_scores, dtype=object), allow_pickle=True)
+                logger.info(f"Saved combined App+Mot scores to {combined_score_file}")
+            
+            if combined_auroc is not None:
+                logger.info(f"Combined App+Mot AUROC: {combined_auroc:.6f}")
+            
+        except Exception as e:
+            logger.error(f"Failed to combine App+Mot signals: {e}")
+    
+    elif len(feature_soup_scores) == 1:
+        logger.info(f"Only one feature type processed: {list(feature_soup_scores.keys())}")
+    else:
+        logger.warning("No feature results available for combination")
     
     # Save complete results
     if output_dir:

@@ -6,3 +6,4 @@ codes/tools/__pycache__/
 artifacts/
 __pycache__
 logger/
+results/
