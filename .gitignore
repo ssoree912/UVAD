@@ -5,3 +5,4 @@ codes/__pycache__/
 codes/tools/__pycache__/
 artifacts/
 __pycache__
+logger/

@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from codes import featurebank, grader
 from codes.tools.soup_methods.cknn_score_soup.knn_score_ensemble import KNNScoreEnsemble, create_multi_cleansing_pipeline
 try:
-    from codes.tools.utils import load_config, task
+    from codes.utils import load_config, task
 except ImportError:
     # Utils might not exist, that's ok
     pass
@@ -364,9 +364,9 @@ def run_cknn_soup_evaluation(dataset_name: str, uvadmode: str,
         
         # Create grader variations
         variations = create_grader_variations(
-            dataset_name, uvadmode, appae_variations, cleanse_thresholds, 
-            k_values, feature_type, args.max_train_samples, args.coreset_method,
-            args.multi_gpu, logger
+            dataset_name, uvadmode, appae_variations, cleanse_thresholds,
+            k_values, feature_type, max_train_samples, coreset_method,
+            multi_gpu, logger
         )
         
         if not variations:
