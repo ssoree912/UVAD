@@ -671,7 +671,10 @@ def main():
         import os
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
         logger_temp = logging.getLogger("gpu_setup")
-        logger_temp.info(f"Set CUDA_VISIBLE_DEVICES={args.gpu}")
+        logger_temp.info(f"Set CUDA_VISIBLE_DEVICES={args.gpu} (Single GPU mode)")
+    else:
+        logger_temp = logging.getLogger("gpu_setup")
+        logger_temp.info("No --gpu specified, using all available GPUs (Multi-GPU mode)")
     
     logger = setup_logger(args.verbose)
     

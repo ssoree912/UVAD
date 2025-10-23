@@ -46,49 +46,99 @@ class KNNGrader(ABCGrader):
                 import gc
                 gc.collect()
                 
-                # Create GPU resources with relaxed memory limit
-                self.res = faiss.StandardGpuResources()
+                # Try Multi-GPU sharding first
+                ngpu = faiss.get_num_gpus()
+                if ngpu > 1:
+                    logging.info(f"[{key}] Trying Multi-GPU sharding with {ngpu} GPUs")
+                    try:
+                        # Create resources for all GPUs
+                        self.res = [faiss.StandardGpuResources() for _ in range(ngpu)]
+                        for r in self.res:
+                            r.setTempMemory(512 * 1024 * 1024)
+                        
+                        # Create CPU index first
+                        cpu_index = faiss.IndexFlatL2(self.tr_x_dim)
+                        cpu_index.add(self.tr_x_cpu)
+                        
+                        # Multi-GPU cloning with sharding
+                        co = faiss.GpuMultipleClonerOptions()
+                        co.shard = True         # DB 샤딩 (데이터 분산)
+                        co.useFloat16 = False   # Float32 유지
+                        
+                        # Clone to multiple GPUs
+                        self.index = faiss.index_cpu_to_gpu_multiple(
+                            self.res, list(range(ngpu)), cpu_index, co
+                        )
+                        self.use_gpu = True
+                        
+                        logging.info(f"[{key}] Successfully created Multi-GPU sharded index on {ngpu} GPUs with {len(tr_x):,} vectors")
+                        
+                    except Exception as multi_gpu_error:
+                        logging.warning(f"[{key}] Multi-GPU failed: {multi_gpu_error}, falling back to single GPU")
+                        # Clean up multi-GPU resources
+                        if hasattr(self, 'res'):
+                            del self.res
+                        # Fall through to single GPU
+                        raise RuntimeError("Multi-GPU failed")
                 
-                # Relax temp memory limit (512MB instead of 128MB)
-                temp_memory_mb = 512  # More generous for cuBLAS stability
-                if hasattr(self.res, 'setTempMemory'):
-                    self.res.setTempMemory(temp_memory_mb * 1024 * 1024)
-                
-                # Use float32 with proper config
-                cfg = faiss.GpuIndexFlatConfig()
-                cfg.device = 0
-                cfg.useFloat16 = False  # Disable float16 due to CUBLAS issues
-                
-                self.index = faiss.GpuIndexFlatL2(self.res, self.tr_x_dim, cfg)
-                self.index.add(self.tr_x_cpu)
-                self.use_gpu = True
-                
-                logging.info(f"[{key}] Successfully created GPU index with {len(tr_x):,} vectors")
-                
-            except RuntimeError as e:
-                if 'cudaMalloc' in str(e) or 'out of memory' in str(e):
-                    logging.warning(
-                        "[%s] GPU allocation failed (%s); falling back to CPU Faiss index.",
-                        key, e
-                    )
-                    # Clean up failed GPU resources
-                    if hasattr(self, 'res') and self.res is not None:
-                        del self.res
-                    self.res = None
-                    
-                    # Create CPU index
-                    self.index = faiss.IndexFlatL2(self.tr_x_dim)
-                    self.index.add(self.tr_x_cpu)
-                    self.use_gpu = False
-                    logging.info(f"[{key}] Successfully created CPU index with {len(tr_x):,} vectors")
                 else:
-                    raise
+                    # Single GPU fallback
+                    logging.info(f"[{key}] Using single GPU (only {ngpu} GPU available)")
+                    raise RuntimeError("Single GPU mode")
+                    
+            except RuntimeError:
+                # Single GPU fallback
+                try:
+                    self.res = faiss.StandardGpuResources()
+                    
+                    # Relax temp memory limit (512MB)
+                    temp_memory_mb = 512
+                    if hasattr(self.res, 'setTempMemory'):
+                        self.res.setTempMemory(temp_memory_mb * 1024 * 1024)
+                    
+                    # Use float32 with proper config
+                    cfg = faiss.GpuIndexFlatConfig()
+                    cfg.device = 0
+                    cfg.useFloat16 = False
+                    
+                    self.index = faiss.GpuIndexFlatL2(self.res, self.tr_x_dim, cfg)
+                    self.index.add(self.tr_x_cpu)
+                    self.use_gpu = True
+                    
+                    logging.info(f"[{key}] Successfully created single GPU index with {len(tr_x):,} vectors")
+                    
+                except RuntimeError as e:
+                    if 'cudaMalloc' in str(e) or 'out of memory' in str(e) or 'CUBLAS' in str(e):
+                        logging.warning(
+                            "[%s] GPU completely failed (%s); falling back to CPU Faiss index.",
+                            key, e
+                        )
+                        # Clean up failed GPU resources
+                        if hasattr(self, 'res') and self.res is not None:
+                            if isinstance(self.res, list):
+                                for r in self.res:
+                                    del r
+                            else:
+                                del self.res
+                        self.res = None
+                        
+                        # Create CPU index
+                        self.index = faiss.IndexFlatL2(self.tr_x_dim)
+                        self.index.add(self.tr_x_cpu)
+                        self.use_gpu = False
+                        logging.info(f"[{key}] Successfully created CPU index with {len(tr_x):,} vectors")
+                    else:
+                        raise
     
     def __del__(self):
         """Clean up GPU resources when grader is deleted"""
         try:
             if hasattr(self, 'res') and self.res is not None:
-                del self.res
+                if isinstance(self.res, list):
+                    for r in self.res:
+                        del r
+                else:
+                    del self.res
             if hasattr(self, 'index') and self.index is not None:
                 del self.index
         except:
