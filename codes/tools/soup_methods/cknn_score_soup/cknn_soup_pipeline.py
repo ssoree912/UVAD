@@ -657,7 +657,7 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--gpu", type=int, default=None, 
                        help="GPU device ID (e.g., 0, 1, 2). If not specified, uses CPU or auto-detects GPU.")
-    parser.add_argument("--max_train_samples", type=int, default=200000,
+    parser.add_argument("--max_train_samples", type=int, default=100000,
                        help="Max training samples per KNN grader (reduces GPU memory usage)")
     parser.add_argument("--coreset_method", choices=["random", "kmeans", "farthest"], default="random",
                        help="Method for selecting coreset when reducing training samples")

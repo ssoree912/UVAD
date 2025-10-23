@@ -51,10 +51,10 @@ class KNNGrader(ABCGrader):
                 if hasattr(self.res, 'setTempMemory'):
                     self.res.setTempMemory(temp_memory_mb * 1024 * 1024)
                 
-                # Use float16 configuration to halve memory usage
+                # Use float32 (float16 causes CUBLAS errors on some matrix sizes)
                 cfg = faiss.GpuIndexFlatConfig()
                 cfg.device = 0
-                cfg.useFloat16 = True  # CRITICAL: Half precision for 50% memory savings
+                cfg.useFloat16 = False  # Disable float16 due to CUBLAS issues
                 
                 self.index = faiss.GpuIndexFlatL2(self.res, tr_x.shape[1], cfg)
                 self.index.add(tr_x.astype(np.float32))
