@@ -25,6 +25,14 @@ except ImportError:
     # Utils might not exist, that's ok
     pass
 
+# GPU memory management
+import gc
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
 # Import for AUROC calculation
 try:
     from sklearn.metrics import roc_auc_score
@@ -153,6 +161,41 @@ def apply_coreset_sampling(features: np.ndarray, max_samples: int,
         raise ValueError(f"Unknown coreset method: {method}")
 
 
+def check_gpu_memory():
+    """Check available GPU memory"""
+    if not HAS_TORCH:
+        return "N/A (torch not available)"
+    
+    try:
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            total = torch.cuda.get_device_properties(device).total_memory / 1024**3  # GB
+            allocated = torch.cuda.memory_allocated(device) / 1024**3  # GB
+            cached = torch.cuda.memory_reserved(device) / 1024**3  # GB
+            free = total - allocated
+            return f"GPU {device}: {free:.1f}GB free / {total:.1f}GB total (allocated: {allocated:.1f}GB, cached: {cached:.1f}GB)"
+        else:
+            return "CUDA not available"
+    except Exception as e:
+        return f"Error checking GPU memory: {e}"
+
+
+def cleanup_gpu_memory():
+    """Clean up GPU memory"""
+    if HAS_TORCH and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
+def estimate_gpu_memory_needed(n_samples: int, dim: int) -> float:
+    """Estimate GPU memory needed for Faiss index in GB"""
+    # Each float32 takes 4 bytes
+    # Faiss typically needs extra memory for temporary buffers (2-3x the data size)
+    data_size_gb = (n_samples * dim * 4) / (1024**3)
+    estimated_total_gb = data_size_gb * 3  # Conservative estimate
+    return estimated_total_gb
+
+
 def load_test_labels(dataset_name: str, uvadmode: str) -> np.ndarray:
     """Load test labels for AUROC calculation"""
     try:
@@ -267,6 +310,17 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
                         )
                         logger.info(f"Coreset applied: {original_size:,} -> {len(tr_f_cleansed):,}")
                     
+                    # Check GPU memory before creating grader
+                    memory_info = check_gpu_memory()
+                    logger.info(f"GPU memory before grader creation: {memory_info}")
+                    
+                    # Estimate memory needed
+                    estimated_gb = estimate_gpu_memory_needed(len(tr_f_cleansed), tr_f_cleansed.shape[1])
+                    logger.info(f"Estimated GPU memory needed: {estimated_gb:.2f} GB")
+                    
+                    # Clean up GPU memory before creating grader
+                    cleanup_gpu_memory()
+                    
                     # Create grader (MultiGPU or standard)
                     if multi_gpu:
                         # TODO: Implement MultiGPUKNNGrader
@@ -274,6 +328,10 @@ def create_grader_variations(dataset_name: str, uvadmode: str,
                         gr = grader.KNNGrader(tr_f_cleansed, K=k, key=f'{feature_type}_{appae_var}')
                     else:
                         gr = grader.KNNGrader(tr_f_cleansed, K=k, key=f'{feature_type}_{appae_var}')
+                    
+                    # Check GPU memory after creating grader
+                    memory_info_after = check_gpu_memory()
+                    logger.info(f"GPU memory after grader creation: {memory_info_after}")
                     
                     # Compute quality metrics based on original cleansed size
                     total_train = len(featurebank.get(dataset_name, feature_type, 'train', uvadmode))
@@ -544,7 +602,7 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--gpu", type=int, default=None, 
                        help="GPU device ID (e.g., 0, 1, 2). If not specified, uses CPU or auto-detects GPU.")
-    parser.add_argument("--max_train_samples", type=int, default=500000,
+    parser.add_argument("--max_train_samples", type=int, default=200000,
                        help="Max training samples per KNN grader (reduces GPU memory usage)")
     parser.add_argument("--coreset_method", choices=["random", "kmeans", "farthest"], default="random",
                        help="Method for selecting coreset when reducing training samples")
