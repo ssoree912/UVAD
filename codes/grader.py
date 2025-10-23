@@ -92,12 +92,35 @@ class KNNGrader(ABCGrader):
             pass
 
     def grade_flat(self, te_x):  # [M, D]
-        Ds, _ = self.index.search(te_x.astype(np.float32), self.K + 1)
+        te_x = te_x.astype(np.float32)
+        
+        # Batch search to avoid large GEMM operations that cause CUBLAS errors
+        batch_size = 32  # Small batches to avoid CUBLAS issues
+        all_distances = []
+        
+        for i in range(0, len(te_x), batch_size):
+            batch = te_x[i:i + batch_size]
+            try:
+                Ds, _ = self.index.search(batch, self.K + 1)
+                all_distances.append(Ds)
+            except RuntimeError as e:
+                if 'CUBLAS' in str(e) or 'cuBLAS' in str(e):
+                    logging.warning(f"[{self.key}] CUBLAS error on batch {i}, retrying with smaller batch")
+                    # Retry with even smaller batches
+                    for j in range(i, min(i + batch_size, len(te_x))):
+                        single_query = te_x[j:j+1]
+                        Ds_single, _ = self.index.search(single_query, self.K + 1)
+                        all_distances.append(Ds_single)
+                else:
+                    raise
+        
+        # Concatenate all batch results
+        Ds = np.concatenate(all_distances, axis=0)
+        
         ret = []
         for vs in Ds:
             if np.any(vs == 0):
                 vs[np.where(vs == 0)[0][0]] = np.inf  # remove only one exact match.
             ret.append(vs[np.argsort(vs)][:-1])
         Ds = np.asarray(ret)
-        # print(Ds.shape)
         return np.mean(Ds, axis=1)
