@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 # Ensure project root on sys.path
 CURRENT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = CURRENT_DIR.parents[4]
+PROJECT_ROOT = CURRENT_DIR.parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
