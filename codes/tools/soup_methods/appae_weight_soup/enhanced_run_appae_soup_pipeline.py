@@ -28,7 +28,11 @@ PROJECT_ROOT = CURRENT_DIR.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from sklearn.mixture import GaussianMixture
+from sklearn.mixture._gaussian_mixture import _compute_precision_cholesky
+
 from codes.cleanse import AppAE, Cleanse, PatchDataset
+from codes import featurebank
 from codes.tools.enhanced_appae_fisher_utils import (
     load_appae_training_config,
     build_patch_dataloader,
@@ -110,6 +114,11 @@ def parse_args() -> argparse.Namespace:
                         help="Run MOT stage after soup.")
     parser.add_argument("--mot_gmm_n", type=int, default=12,
                         help="GMM components for MOT.")
+    parser.add_argument("--mot_model_name", default="fgmm_model.npz",
+                        help="Filename for stored fGMM models inside each run directory.")
+    parser.add_argument("--mot_score_output_template",
+                        default="features/{dataset}/cleansescores/{mode}_velo_fgmm_{label}_flat.npy",
+                        help="Template for MOT pseudo score output path.")
 
     parser.add_argument("--run_eval", action="store_true",
                         help="Run evaluation.")
@@ -231,30 +240,125 @@ def run_appae_inference(dataset_name: str,
     return output_path
 
 
-def run_mot_stage(dataset_name: str,
-                  uvadmode: str,
-                  seed: int,
-                  save_root: str,
-                  log_dir: str,
-                  gmm_n: int,
-                  logger: logging.Logger):
-    logger.info("Running MOT stage.")
-    cmd = [
-        sys.executable,
-        "main1_pseudoanomaly.py",
-        "--dataset_name", dataset_name,
-        "--uvadmode", uvadmode,
-        "--mode", "mot",
-        "--seed", str(seed),
-        "--save_root", save_root,
-        "--log_dir", log_dir,
-        "--gmm_n", str(gmm_n),
-        "--no_stream_logs",
-    ]
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        raise RuntimeError(f"MOT stage failed ({result.returncode}).")
-    logger.info("MOT stage completed.")
+def load_fgmm_model(path: Path) -> GaussianMixture:
+    data = np.load(path, allow_pickle=True)
+    cov_type = str(data['covariance_type'])
+    gmm = GaussianMixture(n_components=len(data['weights']), covariance_type=cov_type)
+    gmm.weights_ = data['weights']
+    gmm.means_ = data['means']
+    gmm.covariances_ = data['covariances']
+    gmm.precisions_cholesky_ = _compute_precision_cholesky(gmm.covariances_, cov_type)
+    gmm.converged_ = bool(data.get('converged', True))
+    gmm.n_features_in_ = gmm.means_.shape[1]
+    return gmm
+
+
+def save_fgmm_model(gmm: GaussianMixture, path: Path, logger: logging.Logger):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        weights=gmm.weights_,
+        means=gmm.means_,
+        covariances=gmm.covariances_,
+        covariance_type=gmm.covariance_type,
+        converged=gmm.converged_
+    )
+    logger.info("Saved merged fGMM model to %s", path)
+
+
+def merge_fgmm_models(models: List[GaussianMixture], coeffs: List[float]) -> GaussianMixture:
+    if not models or not coeffs:
+        raise ValueError("No models or coefficients provided for fGMM merge.")
+
+    if len(models) != len(coeffs):
+        raise ValueError("Number of fGMM models must match coefficients.")
+
+    n_components = models[0].weights_.shape[0]
+    cov_type = models[0].covariance_type
+    dim = models[0].means_.shape[1]
+
+    weights = np.zeros(n_components, dtype=np.float64)
+    means = np.zeros((n_components, dim), dtype=np.float64)
+    covariances = np.zeros((n_components, dim, dim), dtype=np.float64)
+
+    for coeff, model in zip(coeffs, models):
+        weights += coeff * model.weights_
+        means += coeff * model.means_
+        covariances += coeff * model.covariances_
+
+    weights = np.clip(weights, 1e-12, None)
+    weights /= weights.sum()
+    covariances = 0.5 * (covariances + np.transpose(covariances, (0, 2, 1)))
+
+    merged = GaussianMixture(n_components=n_components, covariance_type=cov_type)
+    merged.weights_ = weights
+    merged.means_ = means
+    merged.covariances_ = covariances
+    merged.precisions_cholesky_ = _compute_precision_cholesky(covariances, cov_type)
+    merged.converged_ = all(m.converged_ for m in models)
+    merged.n_features_in_ = dim
+    return merged
+
+
+def run_mot_soup(dataset_name: str,
+                 uvadmode: str,
+                 folders: List[str],
+                 coefficients: List[float],
+                 target_folder: Path,
+                 score_template: str,
+                 model_name: str,
+                 logger: logging.Logger) -> Optional[Path]:
+    if not coefficients:
+        logger.warning("Skipping MOT soup: no coefficients available.")
+        return None
+
+    mot_models = []
+    missing = []
+    for folder in folders:
+        folder_path = Path(folder)
+        candidate_paths = [
+            folder_path / model_name,
+            folder_path.with_name(folder_path.name + "_mot") / model_name
+        ]
+        model_path = next((p for p in candidate_paths if p.exists()), None)
+        if model_path is None:
+            missing.append(str(folder_path))
+            continue
+        try:
+            mot_models.append(load_fgmm_model(model_path))
+        except Exception as exc:
+            logger.warning("Failed to load fGMM model from %s: %s", model_path, exc)
+            missing.append(str(folder_path))
+
+    if missing:
+        logger.warning("MOT soup skipped due to missing models: %s", missing)
+        return None
+
+    if len(mot_models) != len(coefficients):
+        logger.warning("MOT soup skipped: number of models (%d) != coefficients (%d)",
+                       len(mot_models), len(coefficients))
+        return None
+
+    merged_gmm = merge_fgmm_models(mot_models, coefficients)
+
+    mot_model_path = target_folder / model_name
+    save_fgmm_model(merged_gmm, mot_model_path, logger)
+
+    train_features = featurebank.get(dataset_name, 'mot', 'train', uvadmode=uvadmode).astype(np.float32)
+    logger.info("Generating MOT pseudo scores on %d samples.", train_features.shape[0])
+    mot_scores = -merged_gmm.score_samples(train_features)
+
+    label = target_folder.name
+    score_path = Path(score_template.format(
+        dataset=dataset_name,
+        mode=uvadmode,
+        label=label,
+        uvadmode=uvadmode
+    ))
+    score_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(score_path, mot_scores)
+    logger.info("Saved MOT pseudo scores to %s", score_path)
+    return score_path
 
 
 def run_evaluation(dataset_name: str,
@@ -517,16 +621,17 @@ def main():
         "n_coefficient_candidates": args.n_coefficient_candidates,
         "seed": seed,
         "device": str(device),
+        "score_output_template": args.score_output_template,
+        "mot_score_output_template": args.mot_score_output_template,
+        "mot_model_name": args.mot_model_name,
+        "mot_score_path": None,
     }
     
-    metadata_path = target_folder / "enhanced_soup_metadata.json"
-    with open(metadata_path, "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
-    logger.info("Saved metadata to %s", metadata_path)
-
     # Run inference and evaluation if requested
+    label = Path(target_folder).name
+    mot_score_path: Optional[Path] = None
+
     if not args.skip_inference:
-        label = Path(target_folder).name
         score_path_str = args.score_output_template.format(
             dataset=args.dataset_name,
             mode=args.uvadmode,
@@ -541,10 +646,25 @@ def main():
         )
 
     if args.run_mot:
-        run_mot_stage(
-            args.dataset_name, args.uvadmode, seed,
-            cfg.save_root, cfg.log_dir, args.mot_gmm_n, logger
+        mot_score_path = run_mot_soup(
+            args.dataset_name,
+            args.uvadmode,
+            folders,
+            best_coeffs,
+            target_folder,
+            args.mot_score_output_template,
+            args.mot_model_name,
+            logger
         )
+        if mot_score_path is None:
+            logger.warning("MOT soup was requested but could not be completed.")
+        else:
+            metadata["mot_score_path"] = str(mot_score_path)
+
+    metadata_path = target_folder / "enhanced_soup_metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+    logger.info("Saved metadata to %s", metadata_path)
 
     if args.run_eval and eval_config_path:
         evaluation_results = []
@@ -571,12 +691,25 @@ def main():
                         individual_scores_path, inference_batch_size, inference_workers,
                         device, logger
                     )
-                    
+
+                    mot_cleanse_name = f"velo_fgmm_{folder_name}"
+                    mot_score_candidate = Path(args.mot_score_output_template.format(
+                        dataset=args.dataset_name,
+                        mode=eval_mode_default,
+                        label=folder_name,
+                        uvadmode=args.uvadmode
+                    ))
+                    if not mot_score_candidate.exists():
+                        mot_cleanse_name = "velo_fgmm"
+
                     # Evaluate individual model
                     override = json.dumps({
                         "signals": {
                             "app": {
                                 "cleanse_scorename": f"aerecon_{folder_name}"
+                            },
+                            "mot": {
+                                "cleanse_scorename": mot_cleanse_name
                             }
                         }
                     })
@@ -617,6 +750,9 @@ def main():
             "signals": {
                 "app": {
                     "cleanse_scorename": f"aerecon_{label}"
+                },
+                "mot": {
+                    "cleanse_scorename": f"velo_fgmm_{label}" if mot_score_path and mot_score_path.exists() else "velo_fgmm"
                 }
             }
         })

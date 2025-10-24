@@ -248,8 +248,34 @@ def main():
     elif args.mode == 'mot':
         logger.info('Launching fGMM pseudo anomaly pipeline.')
         tr_f = featurebank.get(dataset_name, 'mot', 'train', uvadmode=uvadmode).astype(np.float32)
-        ret = cleanse.fGMM(dataset_name, uvadmode, tr_f, args.gmm_n, logger=logger).infer(tr_f)
-        fpath = f'{dpath}/{uvadmode}_velo_fgmm_flat.npy'
+
+        mot_run_dir = save_root_path / dataset_name / uvadmode / run_name
+        mot_run_dir.mkdir(parents=True, exist_ok=True)
+        mot_model_path = mot_run_dir / 'fgmm_model.npz'
+        logger.info("Saving fGMM model to %s", mot_model_path)
+
+        fgmm = cleanse.fGMM(
+            dataset_name,
+            uvadmode,
+            tr_f,
+            args.gmm_n,
+            logger=logger,
+            model_path=mot_model_path,
+            random_state=seed
+        )
+        ret = fgmm.infer(tr_f)
+
+        if args.score_output:
+            fpath = args.score_output.format(
+                dataset=dataset_name,
+                mode=args.mode,
+                uvadmode=uvadmode,
+                run=run_name,
+                seed=seed
+            )
+        else:
+            suffix = f"_{run_name}" if run_name else ""
+            fpath = f'{dpath}/{uvadmode}_velo_fgmm{suffix}_flat.npy'
 
     else:
         raise ValueError()

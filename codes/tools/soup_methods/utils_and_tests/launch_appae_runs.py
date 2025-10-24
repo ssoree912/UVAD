@@ -184,7 +184,7 @@ def run_mot_stage(args: argparse.Namespace, spec: RunSpec, gpu_id: Optional[int]
         "--uvadmode", args.uvadmode,
         "--mode", "mot",
         "--seed", str(spec.seed),
-        "--run_name", f"{spec.run_name}_mot",
+        "--run_name", spec.run_name,
     ]
     if args.config:
         cmd += ["--config", args.config]

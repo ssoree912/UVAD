@@ -471,18 +471,45 @@ class AppAErecon(Cleanse):
 
 
 class fGMM(Cleanse):
-    def __init__(self, dataset_name, uvadmode, tr_f, N=12, logger: Optional[logging.Logger] = None):
+    def __init__(self,
+                 dataset_name,
+                 uvadmode,
+                 tr_f,
+                 N=12,
+                 logger: Optional[logging.Logger] = None,
+                 model_path: Optional[Path] = None,
+                 random_state: Optional[int] = None):
         super().__init__(dataset_name, uvadmode)
         self.logger = logger or logging.getLogger(f'fGMM.{dataset_name}.{uvadmode}')
+        self.model_path = Path(model_path) if model_path else None
 
         self._log('Fitting GMM with %d samples (%s, %s).',
                   tr_f.shape[0], self.dataset_name, self.uvadmode)
         self._log('Starting GaussianMixture training with %d components.', N)
-        self.gmm = GaussianMixture(n_components=N, max_iter=300).fit(tr_f)
+        self.gmm = GaussianMixture(
+            n_components=N,
+            max_iter=300,
+            random_state=random_state
+        ).fit(tr_f)
+
+        if self.model_path is not None:
+            self.save_model(self.model_path)
 
     def infer(self, tr_f):
         self._log('Inference on %d samples with trained GMM.', tr_f.shape[0])
         return -self.gmm.score_samples(tr_f)
+
+    def save_model(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            path,
+            weights=self.gmm.weights_,
+            means=self.gmm.means_,
+            covariances=self.gmm.covariances_,
+            covariance_type=self.gmm.covariance_type,
+            converged=self.gmm.converged_
+        )
+        self._log('Saved fGMM model to %s', path)
 
     def _log(self, msg, *args):
         if self.logger:
