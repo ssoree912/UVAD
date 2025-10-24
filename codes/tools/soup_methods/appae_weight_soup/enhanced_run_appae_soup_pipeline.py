@@ -33,7 +33,7 @@ from sklearn.mixture._gaussian_mixture import _compute_precision_cholesky
 
 from codes.cleanse import AppAE, Cleanse, PatchDataset
 from codes import featurebank
-from codes.tools.enhanced_appae_fisher_utils import (
+from codes.tools.soup_methods.appae_weight_soup.enhanced_appae_fisher_utils import (
     load_appae_training_config,
     build_patch_dataloader,
     load_appae_model,
