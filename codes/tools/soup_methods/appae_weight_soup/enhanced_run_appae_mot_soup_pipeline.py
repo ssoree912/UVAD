@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Enhanced end-to-end pipeline for AppAE Fisher soup with VAD_soup improvements:
-1. Merge multiple checkpoints with enhanced Fisher-weighted averaging
-2. Support for pruning masks and advanced coefficient optimization
-3. Automatic evaluation and best model selection
-4. Comprehensive metadata tracking
+Enhanced end-to-end pipeline for AppAE + fGMM Fisher soup with VAD_soup improvements:
+1. Merge multiple checkpoints with enhanced Fisher-weighted averaging for appearance
+2. Support Fisher-guided motion (fGMM) soup with shared coefficient schedules
+3. Automatic evaluation, best model selection, and optional MOT refresh
+4. Comprehensive metadata tracking for both modalities
 """
 
 import argparse
@@ -43,6 +43,15 @@ from codes.tools.soup_methods.appae_weight_soup.enhanced_appae_fisher_utils impo
     create_pairwise_grid_coeffs,
     create_random_coeffs,
     evaluate_fisher_soup_candidates
+)
+from codes.tools.soup_methods.appae_weight_soup.enhanced_mot_fisher_utils import (
+    FgmmFisherConfig,
+    compute_fisher_for_fgmm,
+    fgmm_to_state_dict,
+    fisher_weighted_average_fgmm,
+    load_fgmm_fisher,
+    save_fgmm_fisher,
+    state_dict_to_fgmm
 )
 
 
@@ -116,6 +125,14 @@ def parse_args() -> argparse.Namespace:
                         help="GMM components for MOT.")
     parser.add_argument("--mot_model_name", default="fgmm_model.npz",
                         help="Filename for stored fGMM models inside each run directory.")
+    parser.add_argument("--mot_fisher_name", default="fgmm_fisher.pt",
+                        help="Filename for stored fGMM Fisher tensors inside each run directory.")
+    parser.add_argument("--mot_max_samples", type=int, default=1024,
+                        help="Maximum number of motion features for Fisher estimation.")
+    parser.add_argument("--mot_fisher_eps", type=float, default=1e-6,
+                        help="Numerical jitter for fGMM Fisher computation.")
+    parser.add_argument("--mot_recompute_fisher", action="store_true",
+                        help="Force recomputation of fGMM Fisher information.")
     parser.add_argument("--mot_score_output_template",
                         default="features/{dataset}/cleansescores/{mode}_velo_fgmm_{label}_flat.npy",
                         help="Template for MOT pseudo score output path.")
@@ -134,7 +151,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def setup_logger(verbose: bool) -> logging.Logger:
-    logger = logging.getLogger("enhanced_run_appae_soup_pipeline")
+    logger = logging.getLogger("enhanced_run_appae_mot_soup_pipeline")
     logger.handlers.clear()
     handler = logging.StreamHandler()
     formatter = logging.Formatter("[%(asctime)s] %(message)s")
@@ -266,40 +283,6 @@ def save_fgmm_model(gmm: GaussianMixture, path: Path, logger: logging.Logger):
     logger.info("Saved merged fGMM model to %s", path)
 
 
-def merge_fgmm_models(models: List[GaussianMixture], coeffs: List[float]) -> GaussianMixture:
-    if not models or not coeffs:
-        raise ValueError("No models or coefficients provided for fGMM merge.")
-
-    if len(models) != len(coeffs):
-        raise ValueError("Number of fGMM models must match coefficients.")
-
-    n_components = models[0].weights_.shape[0]
-    cov_type = models[0].covariance_type
-    dim = models[0].means_.shape[1]
-
-    weights = np.zeros(n_components, dtype=np.float64)
-    means = np.zeros((n_components, dim), dtype=np.float64)
-    covariances = np.zeros((n_components, dim, dim), dtype=np.float64)
-
-    for coeff, model in zip(coeffs, models):
-        weights += coeff * model.weights_
-        means += coeff * model.means_
-        covariances += coeff * model.covariances_
-
-    weights = np.clip(weights, 1e-12, None)
-    weights /= weights.sum()
-    covariances = 0.5 * (covariances + np.transpose(covariances, (0, 2, 1)))
-
-    merged = GaussianMixture(n_components=n_components, covariance_type=cov_type)
-    merged.weights_ = weights
-    merged.means_ = means
-    merged.covariances_ = covariances
-    merged.precisions_cholesky_ = _compute_precision_cholesky(covariances, cov_type)
-    merged.converged_ = all(m.converged_ for m in models)
-    merged.n_features_in_ = dim
-    return merged
-
-
 def run_mot_soup(dataset_name: str,
                  uvadmode: str,
                  folders: List[str],
@@ -307,12 +290,25 @@ def run_mot_soup(dataset_name: str,
                  target_folder: Path,
                  score_template: str,
                  model_name: str,
-                 logger: logging.Logger) -> Optional[Path]:
+                 fisher_name: str,
+                 fisher_config: FgmmFisherConfig,
+                 recompute_fisher: bool,
+                 fisher_floor: float,
+                 favor_target_model: bool,
+                 normalize_fishers: bool,
+                 logger: logging.Logger,
+                 verbose: bool = False) -> Optional[Path]:
     if not coefficients:
         logger.warning("Skipping MOT soup: no coefficients available.")
         return None
 
-    mot_models = []
+    motion_features = featurebank.get(dataset_name, 'mot', 'train', uvadmode=uvadmode).astype(np.float32)
+    if motion_features.size == 0:
+        logger.warning("Skipping MOT soup: no motion features available.")
+        return None
+
+    mot_state_dicts = []
+    mot_fishers = []
     missing = []
     for folder in folders:
         folder_path = Path(folder)
@@ -325,7 +321,39 @@ def run_mot_soup(dataset_name: str,
             missing.append(str(folder_path))
             continue
         try:
-            mot_models.append(load_fgmm_model(model_path))
+            gmm = load_fgmm_model(model_path)
+            mot_state_dicts.append(fgmm_to_state_dict(gmm))
+
+            fisher_path = model_path.parent / fisher_name
+            fisher = None
+            if fisher_path.exists() and not recompute_fisher:
+                fisher = load_fgmm_fisher(fisher_path)
+
+            if fisher is None or recompute_fisher:
+                if verbose:
+                    logger.info("Computing fGMM Fisher information for %s", model_path.parent)
+                sample_seed = None if fisher_config.seed is None else fisher_config.seed + len(mot_state_dicts) - 1
+                cfg = FgmmFisherConfig(
+                    max_samples=fisher_config.max_samples,
+                    seed=sample_seed,
+                    eps=fisher_config.eps
+                )
+                fisher = compute_fisher_for_fgmm(
+                    gmm,
+                    motion_features,
+                    config=cfg,
+                    logger=logger if verbose else None
+                )
+                metadata = {
+                    "folder": str(model_path.parent),
+                    "model_path": str(model_path),
+                    "max_samples": cfg.max_samples,
+                    "seed": cfg.seed,
+                    "eps": cfg.eps,
+                    "total_features": int(motion_features.shape[0]),
+                }
+                save_fgmm_fisher(fisher, fisher_path, metadata=metadata)
+            mot_fishers.append(fisher)
         except Exception as exc:
             logger.warning("Failed to load fGMM model from %s: %s", model_path, exc)
             missing.append(str(folder_path))
@@ -334,19 +362,26 @@ def run_mot_soup(dataset_name: str,
         logger.warning("MOT soup skipped due to missing models: %s", missing)
         return None
 
-    if len(mot_models) != len(coefficients):
+    if len(mot_state_dicts) != len(coefficients):
         logger.warning("MOT soup skipped: number of models (%d) != coefficients (%d)",
-                       len(mot_models), len(coefficients))
+                       len(mot_state_dicts), len(coefficients))
         return None
 
-    merged_gmm = merge_fgmm_models(mot_models, coefficients)
+    merged_state = fisher_weighted_average_fgmm(
+        mot_state_dicts,
+        mot_fishers,
+        coefficients,
+        fisher_floor=fisher_floor,
+        favor_target_model=favor_target_model,
+        normalize_fishers=normalize_fishers
+    )
+    merged_gmm = state_dict_to_fgmm(merged_state)
 
     mot_model_path = target_folder / model_name
     save_fgmm_model(merged_gmm, mot_model_path, logger)
 
-    train_features = featurebank.get(dataset_name, 'mot', 'train', uvadmode=uvadmode).astype(np.float32)
-    logger.info("Generating MOT pseudo scores on %d samples.", train_features.shape[0])
-    mot_scores = -merged_gmm.score_samples(train_features)
+    logger.info("Generating MOT pseudo scores on %d samples.", motion_features.shape[0])
+    mot_scores = -merged_gmm.score_samples(motion_features)
 
     label = target_folder.name
     score_path = Path(score_template.format(
@@ -624,6 +659,11 @@ def main():
         "score_output_template": args.score_output_template,
         "mot_score_output_template": args.mot_score_output_template,
         "mot_model_name": args.mot_model_name,
+        "mot_fisher_name": args.mot_fisher_name,
+        "mot_max_samples": args.mot_max_samples,
+        "mot_fisher_eps": args.mot_fisher_eps,
+        "mot_recompute_fisher": args.mot_recompute_fisher,
+        "mot_fisher_seed": seed,
         "mot_score_path": None,
     }
     
@@ -646,6 +686,11 @@ def main():
         )
 
     if args.run_mot:
+        mot_fisher_config = FgmmFisherConfig(
+            max_samples=args.mot_max_samples,
+            seed=seed,
+            eps=args.mot_fisher_eps
+        )
         mot_score_path = run_mot_soup(
             args.dataset_name,
             args.uvadmode,
@@ -654,7 +699,14 @@ def main():
             target_folder,
             args.mot_score_output_template,
             args.mot_model_name,
-            logger
+            args.mot_fisher_name,
+            mot_fisher_config,
+            args.mot_recompute_fisher,
+            args.fisher_floor,
+            args.favor_target_model,
+            args.normalize_fishers,
+            logger,
+            verbose=args.verbose
         )
         if mot_score_path is None:
             logger.warning("MOT soup was requested but could not be completed.")

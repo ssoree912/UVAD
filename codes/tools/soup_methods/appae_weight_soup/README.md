@@ -12,8 +12,10 @@
 
 ### Enhanced 버전 (VAD_soup 개선 적용)
 - `enhanced_appae_fisher_utils.py`: VAD_soup 개선사항 적용
+- `enhanced_mot_fisher_utils.py`: fGMM Fisher soup 유틸
 - `enhanced_appae_fisher_soup.py`: 단독 실행 스크립트
-- `enhanced_run_appae_soup_pipeline.py`: 전체 파이프라인
+- `enhanced_mot_fisher_soup.py`: MOT(fGMM) 전용 soup 스크립트
+- `enhanced_run_appae_mot_soup_pipeline.py`: AppAE+MOT 통합 파이프라인
 
 ### Basic 버전
 - `appae_fisher_utils.py`: 기본 Fisher 가중 평균
@@ -27,7 +29,7 @@
 
 ### Enhanced 버전 (권장)
 ```bash
-python enhanced_run_appae_soup_pipeline.py \
+python enhanced_run_appae_mot_soup_pipeline.py \
     --folders artifacts/shanghaitech/merge/seed111 seed222 seed333 \
     --dataset_name shanghaitech \
     --uvadmode merge \
@@ -55,3 +57,14 @@ python run_appae_soup_pipeline.py \
 ## 대안
 
 **CKNN Score-soup** 사용 권장: `../cknn_score_soup/`
+
+### MOT 전용 soup
+```bash
+python enhanced_mot_fisher_soup.py \
+    --folders artifacts/shanghaitech/merge/seed111 artifacts/shanghaitech/merge/seed222 \
+    --dataset_name shanghaitech \
+    --uvadmode merge \
+    --output artifacts/soup_result/fgmm_model.npz \
+    --score_output features/shanghaitech/cleansescores/merge_velo_fgmm_soup_flat.npy \
+    --verbose
+```

@@ -12,9 +12,10 @@
 
 ### ⚠️ **appae_weight_soup/** (기존 방법)
 **AppAE 가중치 soup**: 모델 파라미터 레벨에서 Fisher 가중 평균 (효과 제한적)
-- `enhanced_appae_fisher_*.py`: VAD_soup 개선사항 적용
+- `enhanced_appae_fisher_*.py` / `enhanced_mot_fisher_*.py`: VAD_soup 개선사항 적용 (AppAE & MOT)
+- `enhanced_run_appae_mot_soup_pipeline.py`: 실행 파이프라인
 - `appae_fisher_*.py`: 기본 Fisher 가중 평균
-- `run_appae_soup_pipeline.py`: 실행 파이프라인
+- `run_appae_soup_pipeline.py`: 기본 파이프라인
 - `compute_fisher_appae.py`: Fisher 정보 계산
 
 ### 📦 **model_soup_basic/**
@@ -38,7 +39,7 @@ python run_cknn_soup.py
 ### 2. AppAE Weight Soup (비교용)
 ```bash
 cd appae_weight_soup
-python enhanced_run_appae_soup_pipeline.py --folders ... --dataset_name ...
+python enhanced_run_appae_mot_soup_pipeline.py --folders ... --dataset_name ...
 ```
 
 ### 3. 기본 모델 Soup (베이스라인)
