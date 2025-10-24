@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -244,7 +245,12 @@ def main():
                 seed=seed
             )
         else:
-            fpath = f'{dpath}/{uvadmode}_aerecon_flat.npy'
+            suffix = ""
+            if run_name:
+                suffix = f"_{run_name}"
+            elif seed is not None:
+                suffix = f"_seed{seed}"
+            fpath = f'{dpath}/{uvadmode}_aerecon{suffix}_flat.npy'
     elif args.mode == 'mot':
         logger.info('Launching fGMM pseudo anomaly pipeline.')
         tr_f = featurebank.get(dataset_name, 'mot', 'train', uvadmode=uvadmode).astype(np.float32)
@@ -280,9 +286,17 @@ def main():
     else:
         raise ValueError()
 
-    os.makedirs(os.path.dirname(fpath), exist_ok=True)
-    np.save(fpath, ret)
-    logger.info("Saved outputs to %s", fpath)
+    output_path = Path(fpath)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(output_path, ret)
+    logger.info("Saved outputs to %s", output_path)
+
+    if args.mode == 'app' and not args.score_output:
+        canonical_path = Path(f'{dpath}/{uvadmode}_aerecon_flat.npy')
+        if canonical_path != output_path:
+            canonical_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(output_path, canonical_path)
+            logger.info("Saved compatibility copy to %s", canonical_path)
 
 
 if __name__ == '__main__':
