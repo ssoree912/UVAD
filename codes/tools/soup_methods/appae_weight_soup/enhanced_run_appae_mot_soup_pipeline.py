@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
                         help="Don't apply fisher_floor to first model.")
     parser.add_argument("--normalize_fishers", action="store_true", default=True,
                         help="Normalize Fisher information.")
-    parser.add_argument("--use_masks", action="store_true", default=True,
+    parser.add_argument("--use_masks", action="store_true", default=False,
                         help="Use pruning masks if available.")
 
     parser.add_argument("--subset", type=int, default=None,
@@ -172,6 +172,12 @@ def parse_args() -> argparse.Namespace:
                         help="Quantile (0-1) of LOO distances to score compactness (lower is better). Default 0.5 (median).")
     parser.add_argument("--bank_max_train_samples", type=int, default=50000,
                         help="Max number of kept App samples used for KNN compactness (subsample if larger). 0 disables sampling.")
+    parser.add_argument("--keep_mask_strategy", choices=["soup", "best", "consensus_and", "consensus_or"], default="soup",
+                        help="Strategy for determining keep-mask when coeff_eval=bank.")
+    parser.add_argument("--bank_anchor_score", type=str, default=None,
+                        help="Path to anchor cleanse score (e.g., best single model) used for keep_mask_strategy=best/consensus.")
+    parser.add_argument("--bank_whiten", action="store_true",
+                        help="Whiten kept features before measuring compactness (recommended).")
     return parser.parse_args()
 
 
@@ -554,6 +560,9 @@ class BankCompactnessEvaluator:
                  include_mot: bool,
                  quantile: float,
                  max_train_samples: Optional[int],
+                 keep_mask_strategy: str,
+                 anchor_score_path: Optional[Path],
+                 whiten: bool,
                  device: torch.device,
                  logger: logging.Logger):
         self.dataset_name = dataset_name
@@ -567,9 +576,15 @@ class BankCompactnessEvaluator:
         self.include_mot = include_mot
         self.quantile = quantile
         self.max_train_samples = max_train_samples if (max_train_samples and max_train_samples > 0) else None
+        self.keep_mask_strategy = keep_mask_strategy
+        self.anchor_score_path = anchor_score_path
+        self.whiten = whiten
         self.device = device
         self.logger = logger
         self.evaluation_count = 0
+        self._anchor_scores = None
+        if self.keep_mask_strategy != "soup" and self.anchor_score_path is None:
+            raise ValueError("keep_mask_strategy requires --bank_anchor_score.")
 
     def __call__(self, state_dict: Dict[str, torch.Tensor]) -> float:
         from codes import featurebank as fb
@@ -606,8 +621,7 @@ class BankCompactnessEvaluator:
             else:
                 stat = _fisher_combine_pvals(pvals_list)
 
-            thr = np.percentile(stat, self.percentile)
-            keep_mask = stat <= thr
+            keep_mask = self._resolve_keep_mask(stat)
 
             # 3) App features compactness on kept
             tr_app = fb.get(self.dataset_name, 'app', 'train', uvadmode=self.uvadmode)
@@ -626,8 +640,13 @@ class BankCompactnessEvaluator:
                     )
                     kept = kept[idx]
                     stat = stat[idx]
-                grader = KNNGrader(kept.astype(np.float32), K=self.knn_k, key='bank')
-                dists = grader.grade_flat(kept.astype(np.float32))  # LOO distances
+                kept = kept.astype(np.float32)
+                if self.whiten:
+                    mu = kept.mean(axis=0, keepdims=True)
+                    sigma = kept.std(axis=0, keepdims=True) + 1e-6
+                    kept = (kept - mu) / sigma
+                grader = KNNGrader(kept, K=self.knn_k, key='bank')
+                dists = grader.grade_flat(kept)
                 compact = np.quantile(dists, self.quantile)
                 score = -float(compact)  # smaller is better
 
@@ -647,6 +666,39 @@ class BankCompactnessEvaluator:
         except Exception as e:
             self.logger.warning("Bank evaluator failed: %s", e)
             return 0.0
+
+    def _resolve_keep_mask(self, soup_stat: np.ndarray) -> np.ndarray:
+        """Determine keep mask based on configured strategy."""
+        soup_thr = np.percentile(soup_stat, self.percentile)
+        soup_mask = soup_stat <= soup_thr
+        if self.keep_mask_strategy == "soup":
+            return soup_mask
+
+        anchor_scores = self._load_anchor_scores()
+        if anchor_scores is None or len(anchor_scores) != len(soup_mask):
+            self.logger.warning("Anchor scores unavailable or length mismatch; falling back to soup mask.")
+            return soup_mask
+        anchor_thr = np.percentile(anchor_scores, self.percentile)
+        anchor_mask = anchor_scores <= anchor_thr
+
+        if self.keep_mask_strategy == "best":
+            return anchor_mask
+        if self.keep_mask_strategy == "consensus_and":
+            return anchor_mask & soup_mask
+        if self.keep_mask_strategy == "consensus_or":
+            return anchor_mask | soup_mask
+        return soup_mask
+
+    def _load_anchor_scores(self) -> Optional[np.ndarray]:
+        if self.anchor_score_path is None:
+            return None
+        if self._anchor_scores is None:
+            try:
+                self._anchor_scores = np.load(self.anchor_score_path, allow_pickle=True)
+            except Exception as exc:
+                self.logger.warning("Failed to load anchor scores from %s: %s", self.anchor_score_path, exc)
+                self._anchor_scores = None
+        return self._anchor_scores
 
 
 def main():
@@ -781,11 +833,14 @@ def main():
             if bank_knn_k is None:
                 bank_knn_k = 8
 
+            anchor_score_path = Path(args.bank_anchor_score) if args.bank_anchor_score else None
+
             evaluator = BankCompactnessEvaluator(
                 args.dataset_name, args.uvadmode, target_folder,
                 inference_batch_size, inference_workers, args.score_output_template,
                 bank_percentile, bank_knn_k, args.bank_include_mot, args.bank_quantile,
                 args.bank_max_train_samples,
+                args.keep_mask_strategy, anchor_score_path, args.bank_whiten,
                 device, logger
             )
         else:
