@@ -33,12 +33,30 @@ def fgmm_to_state_dict(gmm: GaussianMixture) -> Dict[str, torch.Tensor]:
     }
 
 
+def _ensure_spd(covariances: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """Project covariance matrices onto the SPD cone for numerical stability."""
+    covariances = 0.5 * (covariances + np.transpose(covariances, (0, 2, 1)))
+    eye = np.eye(covariances.shape[-1], dtype=covariances.dtype)
+    for idx in range(covariances.shape[0]):
+        try:
+            np.linalg.cholesky(covariances[idx])
+            continue
+        except np.linalg.LinAlgError:
+            w, v = np.linalg.eigh(covariances[idx])
+            w = np.clip(w, eps, None)
+            covariances[idx] = (v * w) @ v.T
+    covariances += eps * eye[None, :, :]
+    return covariances
+
+
 def state_dict_to_fgmm(state_dict: Dict[str, torch.Tensor],
-                       covariance_type: str = "full") -> GaussianMixture:
+                       covariance_type: str = "full",
+                       eps: float = 1e-6) -> GaussianMixture:
     """Create a GaussianMixture instance from state dict."""
     weights = state_dict["weights"].detach().cpu().numpy()
     means = state_dict["means"].detach().cpu().numpy()
     covariances = state_dict["covariances"].detach().cpu().numpy()
+    covariances = _ensure_spd(covariances, eps=eps)
 
     n_components = weights.shape[0]
     gmm = GaussianMixture(n_components=n_components, covariance_type=covariance_type)
