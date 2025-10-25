@@ -54,6 +54,17 @@ from codes.tools.soup_methods.appae_weight_soup.enhanced_mot_fisher_utils import
     state_dict_to_fgmm
 )
 
+# ---------- ECDF / Fisher-combine utilities for bank-compactness ----------
+def _ecdf_pvals(scores: np.ndarray) -> np.ndarray:
+    ranks = np.argsort(np.argsort(scores))
+    cdf = (ranks + 1.0) / (len(scores) + 1.0)
+    return 1.0 - cdf
+
+
+def _fisher_combine_pvals(pvals_list: List[np.ndarray], eps: float = 1e-12) -> np.ndarray:
+    Ps = np.clip(np.stack(pvals_list, axis=0), eps, 1.0)
+    return -2.0 * np.sum(np.log(Ps), axis=0)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Enhanced AppAE Fisher soup pipeline with evaluation.")
@@ -147,6 +158,18 @@ def parse_args() -> argparse.Namespace:
                         help="Evaluate individual folders too.")
 
     parser.add_argument("--verbose", action="store_true", help="Verbose logging.")
+    
+    # Coefficient evaluation mode
+    parser.add_argument("--coeff_eval", choices=["bank", "auroc", "proxy"], default="bank",
+                        help="How to evaluate coefficient candidates: bank compactness (unsupervised), auroc (runs eval), or proxy norm.")
+    parser.add_argument("--bank_include_mot", action="store_true",
+                        help="When using coeff_eval=bank, include MOT cleansescores via Fisher p-value combine.")
+    parser.add_argument("--bank_percentile", type=float, default=None,
+                        help="Percentile for cleansing when coeff_eval=bank. Defaults to config signals.app.percentile_cleanse or 75.")
+    parser.add_argument("--bank_knn_k", type=int, default=None,
+                        help="K for KNN compactness when coeff_eval=bank. Defaults to config signals.app.NN or 8.")
+    parser.add_argument("--bank_quantile", type=float, default=0.5,
+                        help="Quantile (0-1) of LOO distances to score compactness (lower is better). Default 0.5 (median).")
     return parser.parse_args()
 
 
@@ -500,6 +523,108 @@ class ModelEvaluator:
             return 0.0
 
 
+class BankCompactnessEvaluator:
+    """Unsupervised evaluator for coefficient candidates based on bank compactness.
+
+    Steps per candidate:
+    1) Save temp AppAE checkpoint and generate cleanse scores for app
+    2) Optionally load MOT cleanse scores and Fisher-combine p-values
+    3) Build keep mask at given percentile and compute LOO-KNN distances on kept app features
+    4) Return negative quantile (lower distance -> higher score)
+    """
+
+    def __init__(self,
+                 dataset_name: str,
+                 uvadmode: str,
+                 target_folder: Path,
+                 inference_batch_size: int,
+                 inference_workers: int,
+                 score_template: str,
+                 percentile: float,
+                 knn_k: int,
+                 include_mot: bool,
+                 quantile: float,
+                 device: torch.device,
+                 logger: logging.Logger):
+        self.dataset_name = dataset_name
+        self.uvadmode = uvadmode
+        self.target_folder = target_folder
+        self.inference_batch_size = inference_batch_size
+        self.inference_workers = inference_workers
+        self.score_template = score_template
+        self.percentile = percentile
+        self.knn_k = knn_k
+        self.include_mot = include_mot
+        self.quantile = quantile
+        self.device = device
+        self.logger = logger
+        self.evaluation_count = 0
+
+    def __call__(self, state_dict: Dict[str, torch.Tensor]) -> float:
+        from codes import featurebank as fb
+        from codes.grader import KNNGrader
+        try:
+            # 1) App cleanse scores for candidate
+            tmp_ckpt = self.target_folder / f"_temp_bank_{self.evaluation_count}.pkl"
+            torch.save(state_dict, tmp_ckpt)
+            label = f"temp_eval_{self.evaluation_count}"
+            score_path = Path(self.score_template.format(
+                dataset=self.dataset_name, mode=self.uvadmode, label=label, uvadmode=self.uvadmode
+            ))
+            run_appae_inference(
+                self.dataset_name, self.uvadmode, tmp_ckpt, score_path,
+                self.inference_batch_size, self.inference_workers, self.device, self.logger
+            )
+            app_scores = np.load(score_path, allow_pickle=True)
+
+            # 2) p-values and optional MOT
+            pvals_list = [_ecdf_pvals(app_scores)]
+            if self.include_mot:
+                mot_path = Path(f"features/{self.dataset_name}/cleansescores/{self.uvadmode}_velo_fgmm_flat.npy")
+                if mot_path.exists():
+                    mot_scores = np.load(mot_path, allow_pickle=True)
+                    if len(mot_scores) == len(app_scores):
+                        pvals_list.append(_ecdf_pvals(mot_scores))
+                    else:
+                        self.logger.warning("MOT scores length mismatch; skipping MOT in bank evaluator.")
+                else:
+                    self.logger.warning("MOT cleanse scores not found at %s; skipping MOT.", mot_path)
+
+            if len(pvals_list) == 1:
+                stat = _fisher_combine_pvals(pvals_list)  # same as using single source
+            else:
+                stat = _fisher_combine_pvals(pvals_list)
+
+            thr = np.percentile(stat, self.percentile)
+            keep_mask = stat <= thr
+
+            # 3) App features compactness on kept
+            tr_app = fb.get(self.dataset_name, 'app', 'train', uvadmode=self.uvadmode)
+            if len(tr_app) != len(keep_mask):
+                self.logger.warning("App features length mismatch with scores; falling back to proxy.")
+                return -float(np.linalg.norm(np.concatenate([v.flatten() for v in state_dict.values() if v.numel() > 0])[:1024]))
+
+            kept = tr_app[keep_mask]
+            if kept.shape[0] < max(self.knn_k + 2, 10):
+                self.logger.warning("Too few kept samples (%d); penalizing.", kept.shape[0])
+                score = -1e9
+            else:
+                grader = KNNGrader(kept.astype(np.float32), K=self.knn_k, key='bank')
+                dists = grader.grade_flat(kept.astype(np.float32))  # LOO distances
+                compact = np.quantile(dists, self.quantile)
+                score = -float(compact)  # smaller is better
+
+            # 4) Cleanup
+            tmp_ckpt.unlink(missing_ok=True)
+            if score_path.exists():
+                score_path.unlink()
+            self.evaluation_count += 1
+            return score
+        except Exception as e:
+            self.logger.warning("Bank evaluator failed: %s", e)
+            return 0.0
+
+
 def main():
     args = parse_args()
     logger = setup_logger(args.verbose)
@@ -607,14 +732,39 @@ def main():
                    len(coefficient_candidates), args.coefficient_strategy)
 
         # Setup evaluator
-        if args.run_eval and eval_config_path:
+        if args.coeff_eval == 'auroc' and eval_config_path:
             evaluator = ModelEvaluator(
                 args.dataset_name, eval_mode_default, eval_config_path,
                 target_folder, device, inference_batch_size, inference_workers,
                 args.score_output_template, logger
             )
+        elif args.coeff_eval == 'bank':
+            # Resolve percentile/K from config if available
+            bank_percentile = args.bank_percentile
+            bank_knn_k = args.bank_knn_k
+            if config_path and (bank_percentile is None or bank_knn_k is None):
+                try:
+                    import yaml
+                    with open(config_path, 'r', encoding='utf-8') as fh:
+                        cfg_yaml = yaml.safe_load(fh) or {}
+                    sig_app = ((cfg_yaml.get('signals') or {}).get('app') or {})
+                    bank_percentile = bank_percentile if bank_percentile is not None else float(sig_app.get('percentile_cleanse', 75))
+                    bank_knn_k = bank_knn_k if bank_knn_k is not None else int(sig_app.get('NN', 8))
+                except Exception as e:
+                    logger.warning("Failed to read signals from config: %s", e)
+            if bank_percentile is None:
+                bank_percentile = 75.0
+            if bank_knn_k is None:
+                bank_knn_k = 8
+
+            evaluator = BankCompactnessEvaluator(
+                args.dataset_name, args.uvadmode, target_folder,
+                inference_batch_size, inference_workers, args.score_output_template,
+                bank_percentile, bank_knn_k, args.bank_include_mot, args.bank_quantile,
+                device, logger
+            )
         else:
-            # Fallback to simple evaluation
+            # Simple proxy fallback
             def simple_evaluator(state_dict):
                 total_norm = sum(torch.norm(p.float()).item() for p in state_dict.values())
                 return -total_norm

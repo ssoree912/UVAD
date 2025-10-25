@@ -107,9 +107,10 @@ def compute_fisher_for_fgmm(gmm: GaussianMixture,
             logger.info("FGMM Fisher: using all %d samples.", total_samples)
 
     torch_features = torch.from_numpy(features).to(torch.float64)
-    weights = torch.as_tensor(gmm.weights_, dtype=torch.float64, requires_grad=True)
-    means = torch.as_tensor(gmm.means_, dtype=torch.float64, requires_grad=True)
-    covariances = torch.as_tensor(gmm.covariances_, dtype=torch.float64, requires_grad=True)
+    # torch.as_tensor in older versions doesn't accept requires_grad; use torch.tensor
+    weights = torch.tensor(gmm.weights_, dtype=torch.float64, requires_grad=True)
+    means = torch.tensor(gmm.means_, dtype=torch.float64, requires_grad=True)
+    covariances = torch.tensor(gmm.covariances_, dtype=torch.float64, requires_grad=True)
 
     params = [weights, means, covariances]
     fisher_accumulators = [
