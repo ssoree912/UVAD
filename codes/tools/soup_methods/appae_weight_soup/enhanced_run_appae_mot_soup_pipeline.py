@@ -170,6 +170,8 @@ def parse_args() -> argparse.Namespace:
                         help="K for KNN compactness when coeff_eval=bank. Defaults to config signals.app.NN or 8.")
     parser.add_argument("--bank_quantile", type=float, default=0.5,
                         help="Quantile (0-1) of LOO distances to score compactness (lower is better). Default 0.5 (median).")
+    parser.add_argument("--bank_max_train_samples", type=int, default=50000,
+                        help="Max number of kept App samples used for KNN compactness (subsample if larger). 0 disables sampling.")
     return parser.parse_args()
 
 
@@ -544,6 +546,7 @@ class BankCompactnessEvaluator:
                  knn_k: int,
                  include_mot: bool,
                  quantile: float,
+                 max_train_samples: Optional[int],
                  device: torch.device,
                  logger: logging.Logger):
         self.dataset_name = dataset_name
@@ -556,6 +559,7 @@ class BankCompactnessEvaluator:
         self.knn_k = knn_k
         self.include_mot = include_mot
         self.quantile = quantile
+        self.max_train_samples = max_train_samples if (max_train_samples and max_train_samples > 0) else None
         self.device = device
         self.logger = logger
         self.evaluation_count = 0
@@ -609,6 +613,12 @@ class BankCompactnessEvaluator:
                 self.logger.warning("Too few kept samples (%d); penalizing.", kept.shape[0])
                 score = -1e9
             else:
+                if self.max_train_samples and kept.shape[0] > self.max_train_samples:
+                    idx = np.random.default_rng(42 + self.evaluation_count).choice(
+                        kept.shape[0], size=self.max_train_samples, replace=False
+                    )
+                    kept = kept[idx]
+                    stat = stat[idx]
                 grader = KNNGrader(kept.astype(np.float32), K=self.knn_k, key='bank')
                 dists = grader.grade_flat(kept.astype(np.float32))  # LOO distances
                 compact = np.quantile(dists, self.quantile)
@@ -761,6 +771,7 @@ def main():
                 args.dataset_name, args.uvadmode, target_folder,
                 inference_batch_size, inference_workers, args.score_output_template,
                 bank_percentile, bank_knn_k, args.bank_include_mot, args.bank_quantile,
+                args.bank_max_train_samples,
                 device, logger
             )
         else:
