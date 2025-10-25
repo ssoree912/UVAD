@@ -512,10 +512,17 @@ class ModelEvaluator:
                 override=override
             )
             
-            # Cleanup
-            temp_checkpoint.unlink()
-            if scores_path.exists():
-                scores_path.unlink()
+            # Cleanup (Py3.7 compat)
+            try:
+                if temp_checkpoint.exists():
+                    temp_checkpoint.unlink()
+            except Exception:
+                pass
+            try:
+                if scores_path.exists():
+                    scores_path.unlink()
+            except Exception:
+                pass
             
             self.evaluation_count += 1
             return auroc if auroc is not None else 0.0
@@ -624,10 +631,17 @@ class BankCompactnessEvaluator:
                 compact = np.quantile(dists, self.quantile)
                 score = -float(compact)  # smaller is better
 
-            # 4) Cleanup
-            tmp_ckpt.unlink(missing_ok=True)
-            if score_path.exists():
-                score_path.unlink()
+            # 4) Cleanup (Py3.7 compat, guard against missing files)
+            try:
+                if tmp_ckpt.exists():
+                    tmp_ckpt.unlink()
+            except Exception:
+                pass
+            try:
+                if score_path.exists():
+                    score_path.unlink()
+            except Exception:
+                pass
             self.evaluation_count += 1
             return score
         except Exception as e:
