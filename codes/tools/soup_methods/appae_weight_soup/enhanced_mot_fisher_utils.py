@@ -63,7 +63,17 @@ def state_dict_to_fgmm(state_dict: Dict[str, torch.Tensor],
     gmm.weights_ = weights
     gmm.means_ = means
     gmm.covariances_ = covariances
-    gmm.precisions_cholesky_ = _compute_precision_cholesky(covariances, covariance_type)
+    gmm.reg_covar = eps
+    eye = np.eye(covariances.shape[-1])
+    for attempt in range(6):
+        try:
+            gmm.precisions_cholesky_ = _compute_precision_cholesky(gmm.covariances_, covariance_type)
+            break
+        except ValueError:
+            gmm.covariances_ += (10 ** attempt) * eps * eye[None, :, :]
+            gmm.covariances_ = _ensure_spd(gmm.covariances_, eps=eps)
+    else:
+        raise ValueError("Unable to make fGMM covariances SPD even after regularization")
     gmm.converged_ = True
     gmm.n_features_in_ = means.shape[1]
     return gmm
