@@ -21,6 +21,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import shlex
+from datetime import datetime
 
 # Ensure project root on sys.path
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -178,6 +180,16 @@ def parse_args() -> argparse.Namespace:
                         help="Path to anchor cleanse score (e.g., best single model) used for keep_mask_strategy=best/consensus.")
     parser.add_argument("--bank_whiten", action="store_true",
                         help="Whiten kept features before measuring compactness (recommended).")
+    parser.add_argument("--logp_app_gmm_k", type=int, default=12,
+                        help="Components for AppAE latent GMM when coeff_eval=logp_app.")
+    parser.add_argument("--logp_app_holdout", type=float, default=0.1,
+                        help="Holdout fraction for logp_app evaluator.")
+    parser.add_argument("--logp_latent", choices=["encoder", "recon"], default="recon",
+                        help="Latent representation to use for logp_app (encoder output if available or reconstruction error).")
+    parser.add_argument("--logp_whiten", action="store_true",
+                        help="Apply whitening before fitting GMM in logp_app evaluator.")
+    parser.add_argument("--logp_max_train_samples", type=int, default=50000,
+                        help="Max number of latent samples for logp_app evaluator (0 disables sampling).")
     return parser.parse_args()
 
 
@@ -191,6 +203,19 @@ def setup_logger(verbose: bool) -> logging.Logger:
     logger.setLevel(logging.INFO if verbose else logging.WARNING)
     logger.propagate = False
     return logger
+
+
+def save_run_configuration(target_folder: Path, args: argparse.Namespace):
+    """Persist CLI invocation and parsed arguments for reproducibility."""
+    target_folder.mkdir(parents=True, exist_ok=True)
+    config_path = target_folder / "run_config.json"
+    payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "command": " ".join(shlex.quote(part) for part in sys.argv),
+        "args": vars(args)
+    }
+    with open(config_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
 
 
 def parse_coefficients(raw: Optional[str], n: int) -> Optional[List[float]]:
@@ -701,6 +726,178 @@ class BankCompactnessEvaluator:
         return self._anchor_scores
 
 
+def _extract_app_latent(model: AppAE, batch: torch.Tensor, mode: str = "recon") -> np.ndarray:
+    """Return latent representation for AppAE batch."""
+    with torch.no_grad():
+        if mode == "encoder" and hasattr(model, "encoder"):
+            latent = model.encoder(batch)
+            if isinstance(latent, (list, tuple)):
+                latent = latent[-1]
+            return latent.flatten(1).detach().cpu().numpy()
+        # Fallback to reconstruction-error vector
+        recon = model(batch)
+        err = ((recon - batch) ** 2).flatten(1)
+        return err.detach().cpu().numpy()
+
+
+class LogProbEvaluatorApp:
+    """Evaluate soup candidates using GMM log-likelihood over AppAE latent space."""
+
+    def __init__(self,
+                 dataset_name: str,
+                 uvadmode: str,
+                 target_folder: Path,
+                 device: torch.device,
+                 inference_batch_size: int,
+                 inference_workers: int,
+                 score_template: str,
+                 percentile: float,
+                 keep_mask_strategy: str,
+                 anchor_score_path: Optional[Path],
+                 gmm_k: int,
+                 holdout_frac: float,
+                 whiten: bool,
+                 max_train_samples: Optional[int],
+                 logger: logging.Logger,
+                 latent_mode: str = "recon"):
+        self.dataset_name = dataset_name
+        self.uvadmode = uvadmode
+        self.target_folder = target_folder
+        self.device = device
+        self.batch_size = inference_batch_size
+        self.num_workers = inference_workers
+        self.score_template = score_template
+        self.percentile = percentile
+        self.keep_mask_strategy = keep_mask_strategy
+        self.anchor_score_path = anchor_score_path
+        self.gmm_k = gmm_k
+        self.holdout_frac = holdout_frac
+        self.whiten = whiten
+        self.max_train_samples = max_train_samples if (max_train_samples and max_train_samples > 0) else None
+        self.logger = logger
+        self.evaluation_count = 0
+        self.latent_mode = latent_mode
+        self._anchor_scores: Optional[np.ndarray] = None
+
+    def __call__(self, state_dict: Dict[str, torch.Tensor]) -> float:
+        try:
+            tmp_ckpt = self.target_folder / f"_temp_logp_{self.evaluation_count}.pkl"
+            torch.save(state_dict, tmp_ckpt)
+            label = f"temp_logp_{self.evaluation_count}"
+            score_path = Path(self.score_template.format(
+                dataset=self.dataset_name,
+                mode=self.uvadmode,
+                label=label,
+                uvadmode=self.uvadmode
+            ))
+            run_appae_inference(
+                self.dataset_name,
+                self.uvadmode,
+                tmp_ckpt,
+                score_path,
+                self.batch_size,
+                self.num_workers,
+                self.device,
+                self.logger
+            )
+            soup_scores = np.load(score_path, allow_pickle=True)
+            keep_mask = self._resolve_keep_mask(soup_scores)
+
+            helper = Cleanse(self.dataset_name, self.uvadmode)
+            paths = helper.get_app_fpaths()
+            dataset = PatchDataset(paths)
+            loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False,
+                                num_workers=self.num_workers, pin_memory=True)
+
+            model = AppAE().to(self.device)
+            model.load_state_dict(state_dict)
+            model.eval()
+
+            latents = []
+            start = 0
+            with torch.no_grad():
+                for batch in loader:
+                    bsz = batch.shape[0]
+                    mask_chunk = keep_mask[start:start + bsz]
+                    if mask_chunk.any():
+                        batch = batch.to(self.device)
+                        latent = _extract_app_latent(model, batch, mode=self.latent_mode)
+                        latents.append(latent[mask_chunk])
+                    start += bsz
+
+            if not latents:
+                score = -1e9
+            else:
+                latent_mat = np.concatenate(latents, axis=0)
+                if self.max_train_samples and latent_mat.shape[0] > self.max_train_samples:
+                    rng = np.random.default_rng(123 + self.evaluation_count)
+                    idx = rng.choice(latent_mat.shape[0], size=self.max_train_samples, replace=False)
+                    latent_mat = latent_mat[idx]
+                if self.whiten:
+                    mean = latent_mat.mean(axis=0, keepdims=True)
+                    std = latent_mat.std(axis=0, keepdims=True) + 1e-6
+                    latent_mat = (latent_mat - mean) / std
+                n = latent_mat.shape[0]
+                holdout = max(32, int(n * self.holdout_frac))
+                if n <= self.gmm_k + holdout:
+                    score = -1e9
+                else:
+                    rng = np.random.default_rng(999 + self.evaluation_count)
+                    perm = rng.permutation(n)
+                    Xte = latent_mat[perm[:holdout]]
+                    Xtr = latent_mat[perm[holdout:]]
+                    gmm = GaussianMixture(n_components=self.gmm_k, covariance_type="full", random_state=0)
+                    gmm.fit(Xtr)
+                    score = float(gmm.score_samples(Xte).mean())
+
+            # Cleanup
+            try:
+                if tmp_ckpt.exists():
+                    tmp_ckpt.unlink()
+            except Exception:
+                pass
+            try:
+                if score_path.exists():
+                    score_path.unlink()
+            except Exception:
+                pass
+            self.evaluation_count += 1
+            return score
+        except Exception as exc:
+            self.logger.warning("LogProb evaluator failed: %s", exc)
+            self.evaluation_count += 1
+            return -1e9
+
+    def _resolve_keep_mask(self, soup_scores: np.ndarray) -> np.ndarray:
+        thr = np.percentile(soup_scores, self.percentile)
+        soup_mask = soup_scores <= thr
+        if self.keep_mask_strategy == "soup":
+            return soup_mask
+        anchor = self._load_anchor_scores()
+        if anchor is None or len(anchor) != len(soup_scores):
+            return soup_mask
+        anchor_thr = np.percentile(anchor, self.percentile)
+        anchor_mask = anchor <= anchor_thr
+        if self.keep_mask_strategy == "best":
+            return anchor_mask
+        if self.keep_mask_strategy == "consensus_and":
+            return anchor_mask & soup_mask
+        if self.keep_mask_strategy == "consensus_or":
+            return anchor_mask | soup_mask
+        return soup_mask
+
+    def _load_anchor_scores(self) -> Optional[np.ndarray]:
+        if self.anchor_score_path is None:
+            return None
+        if self._anchor_scores is None:
+            try:
+                self._anchor_scores = np.load(self.anchor_score_path, allow_pickle=True)
+            except Exception as exc:
+                self.logger.warning("Failed to load anchor scores from %s: %s", self.anchor_score_path, exc)
+                self._anchor_scores = None
+        return self._anchor_scores
+
+
 def main():
     args = parse_args()
     logger = setup_logger(args.verbose)
@@ -767,6 +964,7 @@ def main():
         Path(cfg.save_root) / args.dataset_name / args.uvadmode / "enhanced_soup_run"
     )
     target_folder.mkdir(parents=True, exist_ok=True)
+    save_run_configuration(target_folder, args)
 
     output_checkpoint = Path(args.output_checkpoint) if args.output_checkpoint else (
         target_folder / args.checkpoint_name
@@ -842,6 +1040,27 @@ def main():
                 args.bank_max_train_samples,
                 args.keep_mask_strategy, anchor_score_path, args.bank_whiten,
                 device, logger
+            )
+        elif args.coeff_eval == 'logp_app':
+            anchor_score_path = Path(args.bank_anchor_score) if args.bank_anchor_score else None
+            logp_percentile = args.bank_percentile or 75.0
+            evaluator = LogProbEvaluatorApp(
+                args.dataset_name,
+                args.uvadmode,
+                target_folder,
+                device,
+                inference_batch_size,
+                inference_workers,
+                args.score_output_template,
+                logp_percentile,
+                args.keep_mask_strategy,
+                anchor_score_path,
+                args.logp_app_gmm_k,
+                args.logp_app_holdout,
+                args.logp_whiten,
+                args.logp_max_train_samples if args.logp_max_train_samples > 0 else None,
+                logger,
+                latent_mode=args.logp_latent
             )
         else:
             # Simple proxy fallback
