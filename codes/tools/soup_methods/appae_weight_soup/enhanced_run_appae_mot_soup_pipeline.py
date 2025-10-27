@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple, Dict, Any
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import shlex
@@ -68,6 +69,37 @@ def _fisher_combine_pvals(pvals_list: List[np.ndarray], eps: float = 1e-12) -> n
     return -2.0 * np.sum(np.log(Ps), axis=0)
 
 
+def create_anchor_biased_coeffs_local(n_models: int,
+                                      n_candidates: int,
+                                      anchor_idx: int,
+                                      alpha_anchor: float,
+                                      alpha_others: float,
+                                      min_anchor: float = 0.5,
+                                      seed: Optional[int] = None) -> List[List[float]]:
+    """
+    Sample Dirichlet coefficients while enforcing a strong bias toward an anchor model.
+    """
+    if not (0 <= anchor_idx < n_models):
+        raise ValueError(f"anchor_idx {anchor_idx} out of range for n_models={n_models}")
+    alphas = np.full(n_models, float(alpha_others), dtype=np.float64)
+    alphas[anchor_idx] = float(alpha_anchor)
+    rng = np.random.default_rng(None if seed is None else int(seed))
+    coeffs: List[List[float]] = []
+    max_attempts = max(10 * n_candidates, 100)
+    attempts = 0
+    while len(coeffs) < n_candidates and attempts < max_attempts:
+        attempts += 1
+        vec = rng.dirichlet(alphas).astype(np.float64)
+        if vec[anchor_idx] < min_anchor:
+            continue
+        coeffs.append((vec / vec.sum()).tolist())
+    if len(coeffs) < n_candidates:
+        base = np.zeros(n_models, dtype=np.float64)
+        base[anchor_idx] = 1.0
+        coeffs.append(base.tolist())
+    return coeffs
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Enhanced AppAE Fisher soup pipeline with evaluation.")
     parser.add_argument("--folders", nargs="+", required=True,
@@ -91,18 +123,28 @@ def parse_args() -> argparse.Namespace:
     # Enhanced Fisher soup parameters
     parser.add_argument("--coefficients", type=str, default=None,
                         help="Manual coefficients (comma-separated).")
-    parser.add_argument("--coefficient_strategy", choices=["uniform", "grid", "random"], default="grid",
+    parser.add_argument("--coefficient_strategy", choices=["uniform", "grid", "random", "anchor"], default="grid",
                         help="Coefficient generation strategy.")
     parser.add_argument("--n_coefficient_candidates", type=int, default=15,
                         help="Number of coefficient combinations to try.")
+    parser.add_argument("--anchor_index", type=int, default=0,
+                        help="Index of anchor model (0-based) when using anchor coefficient strategy.")
+    parser.add_argument("--anchor_alpha", type=float, default=5.0,
+                        help="Dirichlet alpha for anchor model when coefficient_strategy=anchor.")
+    parser.add_argument("--others_alpha", type=float, default=1.0,
+                        help="Dirichlet alpha for other models when coefficient_strategy=anchor.")
+    parser.add_argument("--anchor_min", type=float, default=0.5,
+                        help="Minimum anchor weight enforced during anchor-biased sampling.")
     parser.add_argument("--fisher_floor", type=float, default=1e-6,
                         help="Minimum Fisher value.")
     parser.add_argument("--favor_target_model", action="store_true", default=True,
                         help="Don't apply fisher_floor to first model.")
     parser.add_argument("--normalize_fishers", action="store_true", default=True,
                         help="Normalize Fisher information.")
-    parser.add_argument("--use_masks", action="store_true", default=False,
+    parser.add_argument("--use_masks", action="store_true", default=True,
                         help="Use pruning masks if available.")
+    parser.add_argument("--no_use_masks", dest="use_masks", action="store_false",
+                        help="Disable pruning masks even if available.")
 
     parser.add_argument("--subset", type=int, default=None,
                         help="Patch subset for Fisher computation.")
@@ -131,6 +173,10 @@ def parse_args() -> argparse.Namespace:
                         help="Inference batch size.")
     parser.add_argument("--inference_workers", type=int, default=None,
                         help="Inference workers.")
+    parser.add_argument("--refresh_bn", action="store_true",
+                        help="Refresh BatchNorm running stats on merged model before saving.")
+    parser.add_argument("--bn_refresh_batches", type=int, default=200,
+                        help="Number of batches to use for BN refresh (0 uses full dataloader).")
 
     parser.add_argument("--run_mot", action="store_true",
                         help="Run MOT stage after soup.")
@@ -162,8 +208,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true", help="Verbose logging.")
     
     # Coefficient evaluation mode
-    parser.add_argument("--coeff_eval", choices=["bank", "auroc", "proxy"], default="bank",
-                        help="How to evaluate coefficient candidates: bank compactness (unsupervised), auroc (runs eval), or proxy norm.")
+    parser.add_argument("--coeff_eval", choices=["bank", "auroc", "proxy", "logp_app"], default="bank",
+                        help=("How to evaluate coefficient candidates: "
+                              "bank = KNN compactness (unsupervised), "
+                              "auroc = run evaluation script for AUROC, "
+                              "proxy = simple norm proxy, "
+                              "logp_app = average GMM log-likelihood over AppAE latent."))
     parser.add_argument("--bank_include_mot", action="store_true",
                         help="When using coeff_eval=bank, include MOT cleansescores via Fisher p-value combine.")
     parser.add_argument("--bank_percentile", type=float, default=None,
@@ -216,6 +266,33 @@ def save_run_configuration(target_folder: Path, args: argparse.Namespace):
     }
     with open(config_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, default=str)
+
+
+def refresh_batchnorm_stats(model: nn.Module,
+                            loader: DataLoader,
+                            device: torch.device,
+                            max_batches: int = 200,
+                            logger: Optional[logging.Logger] = None):
+    """Run a forward-only pass to update BatchNorm running stats."""
+    has_bn = any(isinstance(m, nn.modules.batchnorm._BatchNorm) for m in model.modules())
+    if not has_bn:
+        if logger:
+            logger.info("BN refresh skipped: no BatchNorm layers detected.")
+        return
+    prev_mode = model.training
+    model.train()
+    n_seen = 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            _ = model(batch)
+            n_seen += 1
+            if max_batches and max_batches > 0 and n_seen >= max_batches:
+                break
+    if not prev_mode:
+        model.eval()
+    if logger:
+        logger.info("BN refresh completed on %d mini-batches.", n_seen)
 
 
 def parse_coefficients(raw: Optional[str], n: int) -> Optional[List[float]]:
@@ -758,6 +835,7 @@ class LogProbEvaluatorApp:
                  holdout_frac: float,
                  whiten: bool,
                  max_train_samples: Optional[int],
+                 seed: int,
                  logger: logging.Logger,
                  latent_mode: str = "recon"):
         self.dataset_name = dataset_name
@@ -774,6 +852,7 @@ class LogProbEvaluatorApp:
         self.holdout_frac = holdout_frac
         self.whiten = whiten
         self.max_train_samples = max_train_samples if (max_train_samples and max_train_samples > 0) else None
+        self.seed = seed
         self.logger = logger
         self.evaluation_count = 0
         self.latent_mode = latent_mode
@@ -830,7 +909,8 @@ class LogProbEvaluatorApp:
             else:
                 latent_mat = np.concatenate(latents, axis=0)
                 if self.max_train_samples and latent_mat.shape[0] > self.max_train_samples:
-                    rng = np.random.default_rng(123 + self.evaluation_count)
+                    base = 0 if self.seed is None else int(self.seed)
+                    rng = np.random.default_rng(base + 123 + self.evaluation_count)
                     idx = rng.choice(latent_mat.shape[0], size=self.max_train_samples, replace=False)
                     latent_mat = latent_mat[idx]
                 if self.whiten:
@@ -842,11 +922,13 @@ class LogProbEvaluatorApp:
                 if n <= self.gmm_k + holdout:
                     score = -1e9
                 else:
-                    rng = np.random.default_rng(999 + self.evaluation_count)
+                    base = 0 if self.seed is None else int(self.seed)
+                    rng = np.random.default_rng(base + 999 + self.evaluation_count)
                     perm = rng.permutation(n)
                     Xte = latent_mat[perm[:holdout]]
                     Xtr = latent_mat[perm[holdout:]]
-                    gmm = GaussianMixture(n_components=self.gmm_k, covariance_type="full", random_state=0)
+                    gmm = GaussianMixture(n_components=self.gmm_k, covariance_type="full",
+                                          random_state=base + 2024 + self.evaluation_count)
                     gmm.fit(Xtr)
                     score = float(gmm.score_samples(Xte).mean())
 
@@ -924,6 +1006,11 @@ def main():
     logger.info("Dataset: %s | UVAD mode: %s | Device: %s", args.dataset_name, args.uvadmode, device)
     logger.info("Folders to merge: %s", ", ".join(str(f) for f in folders))
 
+    if device.type == "cuda":
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
     dataloader, total_samples = build_patch_dataloader(
         args.dataset_name,
         args.uvadmode,
@@ -997,6 +1084,16 @@ def main():
             coefficient_candidates = [[1.0 / len(folders)] * len(folders)]
         elif args.coefficient_strategy == "grid" and len(folders) == 2:
             coefficient_candidates = create_pairwise_grid_coeffs(args.n_coefficient_candidates)
+        elif args.coefficient_strategy == "anchor":
+            coefficient_candidates = create_anchor_biased_coeffs_local(
+                n_models=len(folders),
+                n_candidates=args.n_coefficient_candidates,
+                anchor_idx=int(args.anchor_index),
+                alpha_anchor=float(args.anchor_alpha),
+                alpha_others=float(args.others_alpha),
+                min_anchor=float(args.anchor_min),
+                seed=seed
+            )
         else:
             coefficient_candidates = create_random_coeffs(
                 len(folders), args.n_coefficient_candidates, seed
@@ -1059,6 +1156,7 @@ def main():
                 args.logp_app_holdout,
                 args.logp_whiten,
                 args.logp_max_train_samples if args.logp_max_train_samples > 0 else None,
+                seed,
                 logger,
                 latent_mode=args.logp_latent
             )
@@ -1081,6 +1179,28 @@ def main():
             masks=masks,
             logger=logger
         )
+
+    # Optionally refresh BN running stats before saving
+    if args.refresh_bn:
+        try:
+            bn_model = AppAE().to(device)
+            bn_model.load_state_dict(best_state)
+            refresh_batchnorm_stats(
+                bn_model,
+                dataloader,
+                device,
+                max_batches=args.bn_refresh_batches,
+                logger=logger if args.verbose else None
+            )
+            best_state = bn_model.state_dict()
+            del bn_model
+            if device.type == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("BN refresh failed: %s", exc)
 
     # Save final merged model
     torch.save(best_state, output_checkpoint)
